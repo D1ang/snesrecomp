@@ -477,6 +477,9 @@ typedef struct {
     uint8_t gio[0x300], gio_set[0x300];   /* genuine routine's */
     uint8_t irq_hit;                      /* an interrupt ran mid-routine */
     uint8_t *irq_mask;                    /* WRAM bytes its handler wrote */
+    uint8_t *irq_vmask;                   /* VRAM/CGRAM/OAM words it changed: */
+                                          /* bits 0-$7FFF VRAM, then $100 CGRAM, */
+                                          /* $100 OAM, $20 high OAM */
 } Pending;
 #define VAL_DEPTH 8
 static Pending s_pend[VAL_DEPTH];
@@ -490,6 +493,9 @@ static CpuWriteHandler s_genuine_write = NULL; /* CPU write handler we wrap */
 static bool     s_irq_active = false;
 static uint16_t s_irq_sp;
 static int      s_irq_base;   /* routines pending when it fired: s_pend[0..base) */
+#define IRQ_V_BITS (0x8000 + 0x100 + 0x100 + 0x20)
+static uint16_t s_irq_vram[0x8000], s_irq_cgram[0x100], s_irq_oam[0x100];
+static uint8_t  s_irq_hoam[0x20];
 static int wram_offset(uint32_t adr) {
     uint8_t bank = (uint8_t)(adr >> 16); uint16_t a = (uint16_t)adr;
     if (bank == 0x7E || bank == 0x7F) return ((bank - 0x7E) << 16) | a;
@@ -564,21 +570,21 @@ static void validate_compare(Cpu *c, Pending *p) {
         if (sn->ram[i] != p->ram[i] && n++ == 0)
             snprintf(buf, sizeof(buf), "wram $%05X rom=%02X native=%02X", i, sn->ram[i], p->ram[i]);
     }
-    /* An interrupted call's handler may have DMA'd to VRAM/CGRAM/OAM and
-     * written I/O registers; only its WRAM effects are tracked, so for that
-     * call the comparison is limited to WRAM outside what the handler wrote. */
-    if (p->irq_hit) { v->irq++; goto tally; }
+    /* An interrupted call: what the handler wrote (WRAM bytes, video words,
+     * I/O registers) is left out; everything else is compared as usual. */
+#define VMASKED(b) (p->irq_hit && (p->irq_vmask[(b) >> 3] & (1 << ((b) & 7))))
+    if (p->irq_hit) v->irq++;
     for (int i = 0; i < 0x8000; i++)
-        if (sn->ppu->vram[i] != p->vram[i] && n++ == 0)
+        if (!VMASKED(i) && sn->ppu->vram[i] != p->vram[i] && n++ == 0)
             snprintf(buf, sizeof(buf), "vram word $%04X rom=%04X native=%04X", i, sn->ppu->vram[i], p->vram[i]);
     for (int i = 0; i < 0x100; i++)
-        if (sn->ppu->cgram[i] != p->cgram[i] && n++ == 0)
+        if (!VMASKED(0x8000 + i) && sn->ppu->cgram[i] != p->cgram[i] && n++ == 0)
             snprintf(buf, sizeof(buf), "cgram $%02X rom=%04X native=%04X", i, sn->ppu->cgram[i], p->cgram[i]);
     for (int i = 0; i < 0x100; i++)
-        if (sn->ppu->oam[i] != p->oam[i] && n++ == 0)
+        if (!VMASKED(0x8100 + i) && sn->ppu->oam[i] != p->oam[i] && n++ == 0)
             snprintf(buf, sizeof(buf), "oam word $%02X rom=%04X native=%04X", i, sn->ppu->oam[i], p->oam[i]);
     for (int i = 0; i < 0x20; i++)
-        if (sn->ppu->highOam[i] != p->hoam[i] && n++ == 0)
+        if (!VMASKED(0x8200 + i) && sn->ppu->highOam[i] != p->hoam[i] && n++ == 0)
             snprintf(buf, sizeof(buf), "high oam $%02X rom=%02X native=%02X", i, sn->ppu->highOam[i], p->hoam[i]);
     for (int i = 0; i < 0x300; i++) {
         if (p->nio_set[i] == p->gio_set[i] && (!p->nio_set[i] || p->nio[i] == p->gio[i])) continue;
@@ -588,7 +594,7 @@ static void validate_compare(Cpu *c, Pending *p) {
                      p->gio_set[i] ? "" : "unwritten/", p->gio[i],
                      p->nio_set[i] ? "" : "unwritten/", p->nio[i]);
     }
-tally:
+#undef VMASKED
     v->calls++;
     if (n) {
         v->mem_fail++;
@@ -620,12 +626,36 @@ static bool validate_hook(Cpu *c) {
      * 4-byte interrupt frame pushed, and is done once RTI lifts the stack
      * back above that point. */
     if (s_pend_n > 0) {
-        if (s_irq_active && c->sp > s_irq_sp) s_irq_active = false;
+        if (s_irq_active && c->sp > s_irq_sp) {
+            /* Handler done: whatever video memory it changed is its own. */
+            Snes *sv = snesrecomp_get_snes();
+            for (int k = 0; k < s_irq_base && k < s_pend_n; k++) {
+                uint8_t *m = s_pend[k].irq_vmask;
+                for (int i = 0; i < 0x8000; i++)
+                    if (sv->ppu->vram[i] != s_irq_vram[i]) m[i >> 3] |= (uint8_t)(1 << (i & 7));
+                for (int i = 0; i < 0x100; i++) {
+                    int b = 0x8000 + i;
+                    if (sv->ppu->cgram[i] != s_irq_cgram[i]) m[b >> 3] |= (uint8_t)(1 << (b & 7));
+                    b = 0x8100 + i;
+                    if (sv->ppu->oam[i] != s_irq_oam[i]) m[b >> 3] |= (uint8_t)(1 << (b & 7));
+                }
+                for (int i = 0; i < 0x20; i++) {
+                    int b = 0x8200 + i;
+                    if (sv->ppu->highOam[i] != s_irq_hoam[i]) m[b >> 3] |= (uint8_t)(1 << (b & 7));
+                }
+            }
+            s_irq_active = false;
+        }
         if (!s_irq_active && c->k == 0 &&
             (c->pc == bus_read16(0x00, 0xFFEA) || c->pc == bus_read16(0x00, 0xFFEE))) {
             s_irq_active = true;
             s_irq_sp = c->sp;
             s_irq_base = s_pend_n;
+            Snes *sv = snesrecomp_get_snes();
+            memcpy(s_irq_vram, sv->ppu->vram, sizeof(s_irq_vram));
+            memcpy(s_irq_cgram, sv->ppu->cgram, sizeof(s_irq_cgram));
+            memcpy(s_irq_oam, sv->ppu->oam, sizeof(s_irq_oam));
+            memcpy(s_irq_hoam, sv->ppu->highOam, sizeof(s_irq_hoam));
             for (int k = 0; k < s_pend_n; k++) s_pend[k].irq_hit = 1;
         }
     } else {
@@ -669,9 +699,11 @@ static bool validate_hook(Cpu *c) {
         p->oam = (uint16_t *)malloc(0x200);
         p->hoam = (uint8_t *)malloc(0x20);
         p->irq_mask = (uint8_t *)malloc(0x20000 / 8);
+        p->irq_vmask = (uint8_t *)malloc((IRQ_V_BITS + 7) / 8);
     }
     p->irq_hit = 0;
     memset(p->irq_mask, 0, 0x20000 / 8);
+    memset(p->irq_vmask, 0, (IRQ_V_BITS + 7) / 8);
 
     /* Where the genuine routine will come back to. */
     uint16_t sp = c->sp;
