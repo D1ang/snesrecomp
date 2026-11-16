@@ -462,6 +462,7 @@ void recomp_timed_profile_dump(int top) {
 typedef struct {
     uint32_t addr; bool is_long;
     unsigned long calls, mem_fail, reg_fail, skipped, mx_fail;
+    unsigned long irq;   /* calls an NMI/IRQ handler interrupted */
     char first[200];
     char first_reg[160];
 } Validate;
@@ -474,6 +475,8 @@ typedef struct {
     uint16_t a, x, y, dp; uint8_t db, c, z, n, v, mf, xf;
     uint8_t nio[0x300], nio_set[0x300];   /* native body's register writes */
     uint8_t gio[0x300], gio_set[0x300];   /* genuine routine's */
+    uint8_t irq_hit;                      /* an interrupt ran mid-routine */
+    uint8_t *irq_mask;                    /* WRAM bytes its handler wrote */
 } Pending;
 #define VAL_DEPTH 8
 static Pending s_pend[VAL_DEPTH];
@@ -481,6 +484,18 @@ static int     s_pend_n = 0;
 static uint8_t *s_state_buf = NULL;
 static Pending *s_native_cap = NULL;          /* set while a native body runs */
 static CpuWriteHandler s_genuine_write = NULL; /* CPU write handler we wrap */
+/* An NMI/IRQ handler taken while a genuine routine is under check: its
+ * writes land in the genuine run but can never happen in the native body,
+ * which runs between frames. Track them so the compare can leave them out. */
+static bool     s_irq_active = false;
+static uint16_t s_irq_sp;
+static int      s_irq_base;   /* routines pending when it fired: s_pend[0..base) */
+static int wram_offset(uint32_t adr) {
+    uint8_t bank = (uint8_t)(adr >> 16); uint16_t a = (uint16_t)adr;
+    if (bank == 0x7E || bank == 0x7F) return ((bank - 0x7E) << 16) | a;
+    if ((bank < 0x40 || (bank >= 0x80 && bank < 0xC0)) && a < 0x2000) return a;
+    return -1;
+}
 
 static int io_index(uint32_t adr) {
     uint8_t bank = (uint8_t)(adr >> 16);
@@ -502,8 +517,17 @@ void recomp_validate_note_write(uint32_t adr, uint8_t val) {
 
 static void genuine_write(void *mem, uint32_t adr, uint8_t val) {
     int i = io_index(adr);
+    /* Routines entered inside the handler see its writes as their own; the
+     * ones it interrupted get them masked instead. */
+    int first = s_irq_active ? s_irq_base : 0;
     if (i >= 0)
-        for (int k = 0; k < s_pend_n; k++) { s_pend[k].gio[i] = val; s_pend[k].gio_set[i] = 1; }
+        for (int k = first; k < s_pend_n; k++) { s_pend[k].gio[i] = val; s_pend[k].gio_set[i] = 1; }
+    if (s_irq_active) {
+        int w = wram_offset(adr);
+        if (w >= 0)
+            for (int k = 0; k < s_irq_base && k < s_pend_n; k++)
+                s_pend[k].irq_mask[w >> 3] |= (uint8_t)(1 << (w & 7));
+    }
     s_genuine_write(mem, adr, val);
 }
 extern bool g_recomp_validating, g_recomp_frame_touched;
@@ -522,8 +546,8 @@ void recomp_timed_add_validate(uint32_t snes_addr, bool is_long) {
 void recomp_timed_validate_report(void) {
     for (int i = 0; i < s_val_n; i++) {
         Validate *v = &s_val[i];
-        fprintf(stderr, "VALIDATE %06X calls=%lu mem_fail=%lu reg_fail=%lu mx_fail=%lu skipped=%lu%s%s%s%s\n",
-                v->addr, v->calls, v->mem_fail, v->reg_fail, v->mx_fail, v->skipped,
+        fprintf(stderr, "VALIDATE %06X calls=%lu mem_fail=%lu reg_fail=%lu mx_fail=%lu skipped=%lu irq=%lu%s%s%s%s\n",
+                v->addr, v->calls, v->mem_fail, v->reg_fail, v->mx_fail, v->skipped, v->irq,
                 v->first[0] ? " first: " : "", v->first,
                 v->first_reg[0] ? " | reg: " : "", v->first_reg);
     }
@@ -536,9 +560,14 @@ static void validate_compare(Cpu *c, Pending *p) {
     int n = 0;
     for (int i = 0; i < 0x20000; i++) {
         if (i <= p->entry_sp && i > p->entry_sp - 0x100) continue;   /* stack scratch */
+        if (p->irq_hit && (p->irq_mask[i >> 3] & (1 << (i & 7)))) continue;  /* handler wrote it */
         if (sn->ram[i] != p->ram[i] && n++ == 0)
             snprintf(buf, sizeof(buf), "wram $%05X rom=%02X native=%02X", i, sn->ram[i], p->ram[i]);
     }
+    /* An interrupted call's handler may have DMA'd to VRAM/CGRAM/OAM and
+     * written I/O registers; only its WRAM effects are tracked, so for that
+     * call the comparison is limited to WRAM outside what the handler wrote. */
+    if (p->irq_hit) { v->irq++; goto tally; }
     for (int i = 0; i < 0x8000; i++)
         if (sn->ppu->vram[i] != p->vram[i] && n++ == 0)
             snprintf(buf, sizeof(buf), "vram word $%04X rom=%04X native=%04X", i, sn->ppu->vram[i], p->vram[i]);
@@ -559,6 +588,7 @@ static void validate_compare(Cpu *c, Pending *p) {
                      p->gio_set[i] ? "" : "unwritten/", p->gio[i],
                      p->nio_set[i] ? "" : "unwritten/", p->nio[i]);
     }
+tally:
     v->calls++;
     if (n) {
         v->mem_fail++;
@@ -585,6 +615,22 @@ static bool validate_hook(Cpu *c) {
      * would overwrite the saved state the outer one restores from. */
     if (g_recomp_validating) return false;
     uint32_t pc = ((uint32_t)c->k << 16) | (uint16_t)c->pc;
+
+    /* Interrupt bookkeeping: the handler is entered at its vector with the
+     * 4-byte interrupt frame pushed, and is done once RTI lifts the stack
+     * back above that point. */
+    if (s_pend_n > 0) {
+        if (s_irq_active && c->sp > s_irq_sp) s_irq_active = false;
+        if (!s_irq_active && c->k == 0 &&
+            (c->pc == bus_read16(0x00, 0xFFEA) || c->pc == bus_read16(0x00, 0xFFEE))) {
+            s_irq_active = true;
+            s_irq_sp = c->sp;
+            s_irq_base = s_pend_n;
+            for (int k = 0; k < s_pend_n; k++) s_pend[k].irq_hit = 1;
+        }
+    } else {
+        s_irq_active = false;
+    }
 
     /* A pending routine returned? Innermost first. If the stack has unwound
      * past its return frame without coming back through it (it popped its own
@@ -622,7 +668,10 @@ static bool validate_hook(Cpu *c) {
         p->cgram = (uint16_t *)malloc(0x200);
         p->oam = (uint16_t *)malloc(0x200);
         p->hoam = (uint8_t *)malloc(0x20);
+        p->irq_mask = (uint8_t *)malloc(0x20000 / 8);
     }
+    p->irq_hit = 0;
+    memset(p->irq_mask, 0, 0x20000 / 8);
 
     /* Where the genuine routine will come back to. */
     uint16_t sp = c->sp;
