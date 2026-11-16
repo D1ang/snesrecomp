@@ -651,6 +651,15 @@ static bool validate_hook(Cpu *c) {
             s_irq_active = true;
             s_irq_sp = c->sp;
             s_irq_base = s_pend_n;
+            /* The CPU pushed its 4-byte interrupt frame (PB, PC, P) itself,
+             * not through the write handler; it can land above a routine's
+             * entry stack pointer when the interrupt comes right at its
+             * return. Those bytes belong to the interrupt too. */
+            for (int k = 0; k < s_pend_n; k++)
+                for (int b = 1; b <= 4; b++) {
+                    uint16_t w = (uint16_t)(c->sp + b);
+                    s_pend[k].irq_mask[w >> 3] |= (uint8_t)(1 << (w & 7));
+                }
             Snes *sv = snesrecomp_get_snes();
             memcpy(s_irq_vram, sv->ppu->vram, sizeof(s_irq_vram));
             memcpy(s_irq_cgram, sv->ppu->cgram, sizeof(s_irq_cgram));
