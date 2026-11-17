@@ -124,6 +124,15 @@ void recomp_timed_add_frame_driver(uint32_t snes_addr, bool is_long);
  * stay on the C stack (cheaper); a body that presents a frame there would do
  * it from C, outside the timed frame. */
 void recomp_timed_add_framed_intercept(uint32_t snes_addr, bool is_long);
+/* True when the native body running now can wait at a frame driver (it is
+ * under lockstep validation, or runs as a framed intercept). A body that may
+ * also run as a plain intercept checks this before a frame-driver call and
+ * otherwise hands over to the ROM (recomp_set_redirect). */
+bool recomp_frame_wait_possible(void);
+/* True when a native body may run the C version of snes_addr: always under
+ * lockstep validation, in the timed loop only for verified routines (the
+ * intercepts). A caller can hand an unverified path to the ROM instead. */
+bool recomp_timed_trusted(uint32_t snes_addr);
 /* Internal: func_table dispatch asks whether a call suspends the body. */
 bool recomp_validate_frame_call(uint32_t snes_addr);
 

@@ -957,6 +957,11 @@ static bool validate_hook(Cpu *c) {
     for (int i = 0; i < s_val_n; i++)
         if (s_val[i].addr == pc) { idx = i; break; }
     if (idx < 0 || s_pend_n >= VAL_DEPTH) return false;
+    /* A loop that branches back to its own entry (BRA to the routine's first
+     * instruction) passes the entry again at the same stack depth: that is
+     * not a call, the pending check of the routine covers it. */
+    for (int k = 0; k < s_pend_n; k++)
+        if (s_pend[k].idx == idx && s_pend[k].entry_sp == c->sp) return false;
     /* Each check copies the whole machine twice, so a routine called 100k
      * times would take minutes. SNESRECOMP_VALIDATE_MAX (default 300) caps the
      * checked calls per function; later calls just run genuine. */
@@ -1102,6 +1107,21 @@ static void ico_after(Cpu *c, InterceptCo *t) {
 }
 
 /* A suspended body whose frame driver just returned? Resume it. */
+/* Can the native body that runs now wait for a frame (a validation
+ * coroutine or a framed intercept)? Otherwise a frame-driver call would
+ * present the frame from C; such a body should hand over to the ROM. */
+bool recomp_frame_wait_possible(void) { return s_co_cur != NULL || s_ico_cur != NULL; }
+
+/* May a native body call the C version of snes_addr? Under lockstep
+ * validation yes (that is how callers check their callees' paths); in the
+ * timed loop only if it is an intercept, i.e. verified on its own. */
+bool recomp_timed_trusted(uint32_t snes_addr) {
+    if (s_val_n) return true;
+    for (int i = 0; i < s_intercept_count; i++)
+        if (s_intercepts[i].addr == snes_addr) return true;
+    return false;
+}
+
 static bool ico_resume(Cpu *c) {
     for (int i = s_ico_n - 1; i >= 0; i--) {
         InterceptCo *t = &s_ico[i];
