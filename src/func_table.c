@@ -67,6 +67,8 @@ snes_func_t func_table_lookup(uint32_t snes_addr) {
     return NULL;
 }
 
+snes_func_t func_table_native(uint32_t snes_addr) { return func_table_lookup(snes_addr); }
+
 static bool func_table_dispatch(uint32_t snes_addr, bool is_long) {
     /* A native body under lockstep check that calls a frame driver is
      * suspended there (recomp_interp.c). The genuine code runs meanwhile at

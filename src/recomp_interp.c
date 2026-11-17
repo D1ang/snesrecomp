@@ -512,6 +512,7 @@ static const FrameDriver *frame_driver(uint32_t addr) {
         if (s_fd[i].addr == addr) return &s_fd[i];
     return NULL;
 }
+bool recomp_is_frame_driver(uint32_t snes_addr) { return frame_driver(snes_addr) != NULL; }
 
 typedef struct {
     uint32_t addr; bool is_long;
@@ -1116,7 +1117,7 @@ bool recomp_frame_wait_possible(void) { return s_co_cur != NULL || s_ico_cur != 
  * validation yes (that is how callers check their callees' paths); in the
  * timed loop only if it is an intercept, i.e. verified on its own. */
 bool recomp_timed_trusted(uint32_t snes_addr) {
-    if (s_val_n) return true;
+    if (s_val_n || s_intercept_count == 0) return true;   /* validating, or no timed loop */
     for (int i = 0; i < s_intercept_count; i++)
         if (s_intercepts[i].addr == snes_addr) return true;
     return false;

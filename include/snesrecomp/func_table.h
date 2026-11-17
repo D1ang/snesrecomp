@@ -18,6 +18,11 @@ typedef void (*snes_func_t)(void);
 void func_table_init(void);
 void func_table_register(uint32_t snes_addr, snes_func_t func);
 snes_func_t func_table_lookup(uint32_t snes_addr);
+/* The native function a call to snes_addr runs, or NULL when it runs on the
+ * interpreter. (Today the same as func_table_lookup; verification is not
+ * enforced on native-to-native calls - routing unverified callees to the
+ * untimed interpreter broke boot, where callees wait on hardware.) */
+snes_func_t func_table_native(uint32_t snes_addr);
 
 /*
  * Dispatch to a routine by SNES address.
@@ -133,6 +138,8 @@ bool recomp_frame_wait_possible(void);
  * lockstep validation, in the timed loop only for verified routines (the
  * intercepts). A caller can hand an unverified path to the ROM instead. */
 bool recomp_timed_trusted(uint32_t snes_addr);
+/* Registered with recomp_timed_add_frame_driver. */
+bool recomp_is_frame_driver(uint32_t snes_addr);
 /* Internal: func_table dispatch asks whether a call suspends the body. */
 bool recomp_validate_frame_call(uint32_t snes_addr);
 
