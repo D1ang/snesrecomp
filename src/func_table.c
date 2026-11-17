@@ -68,6 +68,17 @@ snes_func_t func_table_lookup(uint32_t snes_addr) {
 }
 
 static bool func_table_dispatch(uint32_t snes_addr, bool is_long) {
+    /* A native body under lockstep check that calls a frame driver is
+     * suspended there (recomp_interp.c). The genuine code runs meanwhile at
+     * dispatch depth 0, so the depth of the suspended calls is set aside. */
+    extern bool g_recomp_validating;
+    if (g_recomp_validating) {
+        int saved = s_call_depth;
+        s_call_depth = 0;
+        bool yielded = recomp_validate_frame_call(snes_addr);
+        s_call_depth = saved;
+        if (yielded) return true;
+    }
     int maxd = recomp_max_depth();
     /* Below the depth limit, run the native recompiled body (C call). At/above
      * it, fall through to the interpreter so deep/cyclic dispatch unwinds on the

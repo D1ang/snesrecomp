@@ -350,8 +350,8 @@ void recomp_interp_call(uint32_t snes_addr, bool is_long) {
 
 extern bool (*g_cpuRecompHook)(Cpu*);
 
-typedef struct { uint32_t addr; bool is_long; } TimedIntercept;
-static TimedIntercept s_intercepts[128];
+typedef struct { uint32_t addr; bool is_long; bool framed; } TimedIntercept;
+static TimedIntercept s_intercepts[1024];
 static int            s_intercept_count = 0;
 static unsigned long  s_intercept_hits  = 0;
 
@@ -361,8 +361,17 @@ void recomp_timed_add_intercept(uint32_t snes_addr, bool is_long) {
     if (s_intercept_count < (int)(sizeof(s_intercepts) / sizeof(s_intercepts[0]))) {
         s_intercepts[s_intercept_count].addr    = snes_addr;
         s_intercepts[s_intercept_count].is_long = is_long;
+        s_intercepts[s_intercept_count].framed  = false;
         s_intercept_count++;
+    } else {
+        fprintf(stderr, "recomp: intercept table full, $%06X stays on the ROM\n", snes_addr);
     }
+}
+
+void recomp_timed_add_framed_intercept(uint32_t snes_addr, bool is_long) {
+    recomp_timed_add_intercept(snes_addr, is_long);
+    for (int i = 0; i < s_intercept_count; i++)
+        if (s_intercepts[i].addr == snes_addr) s_intercepts[i].framed = true;
 }
 
 unsigned long recomp_timed_intercept_hits(void) { return s_intercept_hits; }
@@ -459,10 +468,56 @@ void recomp_timed_profile_dump(int top) {
  * separately (a hand-port often leaves A/X/Y different where no caller looks).
  * A native body that exits through recomp_set_redirect is counted as skipped.
  */
+/* ---- Coroutines for frame-driving native bodies -------------------------
+ *
+ * A native body that waits for frames (a menu loop, a fade, a pause screen)
+ * cannot be checked as one call: the genuine routine spans many frames, with
+ * NMIs and input in between. So each native body under check runs on a
+ * stack of its own. When it calls a registered frame driver
+ * (recomp_timed_add_frame_driver) it is suspended there instead; the genuine
+ * routine runs until it enters a frame driver too, and the machine is
+ * compared at that point. The genuine frame driver then runs for real, and
+ * once it returns the native body resumes on that machine state, with the
+ * registers the driver returned, up to its next frame or its end. Each piece
+ * between two frames is checked like a whole call of an ordinary routine.
+ * Frames are paired in order: the k-th frame the native body waits for with
+ * the k-th frame driver the genuine routine enters (the stack depth cannot
+ * pair them: native bodies do not mirror the ROM's PHA/PHP pushes).
+ */
+#ifdef _WIN32
+#include <windows.h>
+typedef struct { LPVOID fiber, ret; } CoCtx;   /* ret: who switched in */
+static LPVOID s_main_fiber = NULL;
+#else
+#include <ucontext.h>
+typedef struct { ucontext_t uc, ret; char *stack; } CoCtx;   /* ret: who switched in */
+#endif
+#define CO_STACK (1 << 20)
+
+typedef struct { uint32_t addr; bool is_long; } FrameDriver;
+static FrameDriver s_fd[16];
+static int         s_fd_n = 0;
+
+void recomp_timed_add_frame_driver(uint32_t snes_addr, bool is_long) {
+    for (int i = 0; i < s_fd_n; i++)
+        if (s_fd[i].addr == snes_addr) return;
+    if (s_fd_n < (int)(sizeof(s_fd) / sizeof(s_fd[0]))) {
+        s_fd[s_fd_n].addr = snes_addr;
+        s_fd[s_fd_n].is_long = is_long;
+        s_fd_n++;
+    }
+}
+static const FrameDriver *frame_driver(uint32_t addr) {
+    for (int i = 0; i < s_fd_n; i++)
+        if (s_fd[i].addr == addr) return &s_fd[i];
+    return NULL;
+}
+
 typedef struct {
     uint32_t addr; bool is_long;
     unsigned long calls, mem_fail, reg_fail, skipped, mx_fail;
     unsigned long irq;   /* calls an NMI/IRQ handler interrupted */
+    unsigned long frames;   /* frames waited for inside checked calls */
     char first[200];
     char first_reg[160];
 } Validate;
@@ -480,7 +535,20 @@ typedef struct {
     uint8_t *irq_vmask;                   /* VRAM/CGRAM/OAM words it changed: */
                                           /* bits 0-$7FFF VRAM, then $100 CGRAM, */
                                           /* $100 OAM, $20 high OAM */
+    /* Frame-driving bodies (see the coroutine note above). */
+    int phase;                            /* PH_* below */
+    snes_func_t fn;
+    CoCtx co;
+    bool co_yielded;                      /* stopped at a frame driver (else ended) */
+    uint32_t fd_addr;                     /* the driver it stopped at */
+    uint16_t native_s;                    /* its S there (native view) */
+    uint8_t ret_k; uint16_t ret_pc, ret_sp;   /* where the genuine driver returns */
+    unsigned frames;                      /* frames passed so far */
 } Pending;
+enum { PH_FINAL,      /* native body ended: compare at the routine's return */
+       PH_SEG,        /* native waits at a frame driver: compare when the ROM enters one */
+       PH_FRAME,      /* genuine frame driver running: resume the native body when it returns */
+       PH_DONE };     /* decided early (failed or skipped): nothing more to compare */
 #define VAL_DEPTH 8
 static Pending s_pend[VAL_DEPTH];
 static int     s_pend_n = 0;
@@ -552,54 +620,73 @@ void recomp_timed_add_validate(uint32_t snes_addr, bool is_long) {
 void recomp_timed_validate_report(void) {
     for (int i = 0; i < s_val_n; i++) {
         Validate *v = &s_val[i];
-        fprintf(stderr, "VALIDATE %06X calls=%lu mem_fail=%lu reg_fail=%lu mx_fail=%lu skipped=%lu irq=%lu%s%s%s%s\n",
-                v->addr, v->calls, v->mem_fail, v->reg_fail, v->mx_fail, v->skipped, v->irq,
+        fprintf(stderr, "VALIDATE %06X calls=%lu mem_fail=%lu reg_fail=%lu mx_fail=%lu skipped=%lu irq=%lu frames=%lu%s%s%s%s\n",
+                v->addr, v->calls, v->mem_fail, v->reg_fail, v->mx_fail, v->skipped, v->irq, v->frames,
                 v->first[0] ? " first: " : "", v->first,
                 v->first_reg[0] ? " | reg: " : "", v->first_reg);
     }
 }
 
-static void validate_compare(Cpu *c, Pending *p) {
+/* WRAM/VRAM/CGRAM/OAM/I/O differences between the live (genuine) machine and
+ * what the native body produced; the first one goes to buf. */
+static int validate_diff(Pending *p, char *buf, size_t bufsz) {
     Snes *sn = snesrecomp_get_snes();
-    Validate *v = &s_val[p->idx];
-    char buf[200] = "";
     int n = 0;
+    buf[0] = 0;
     for (int i = 0; i < 0x20000; i++) {
         if (i <= p->entry_sp && i > p->entry_sp - 0x100) continue;   /* stack scratch */
         if (p->irq_hit && (p->irq_mask[i >> 3] & (1 << (i & 7)))) continue;  /* handler wrote it */
         if (sn->ram[i] != p->ram[i] && n++ == 0)
-            snprintf(buf, sizeof(buf), "wram $%05X rom=%02X native=%02X", i, sn->ram[i], p->ram[i]);
+            snprintf(buf, bufsz, "wram $%05X rom=%02X native=%02X", i, sn->ram[i], p->ram[i]);
     }
     /* An interrupted call: what the handler wrote (WRAM bytes, video words,
      * I/O registers) is left out; everything else is compared as usual. */
 #define VMASKED(b) (p->irq_hit && (p->irq_vmask[(b) >> 3] & (1 << ((b) & 7))))
-    if (p->irq_hit) v->irq++;
     for (int i = 0; i < 0x8000; i++)
         if (!VMASKED(i) && sn->ppu->vram[i] != p->vram[i] && n++ == 0)
-            snprintf(buf, sizeof(buf), "vram word $%04X rom=%04X native=%04X", i, sn->ppu->vram[i], p->vram[i]);
+            snprintf(buf, bufsz, "vram word $%04X rom=%04X native=%04X", i, sn->ppu->vram[i], p->vram[i]);
     for (int i = 0; i < 0x100; i++)
         if (!VMASKED(0x8000 + i) && sn->ppu->cgram[i] != p->cgram[i] && n++ == 0)
-            snprintf(buf, sizeof(buf), "cgram $%02X rom=%04X native=%04X", i, sn->ppu->cgram[i], p->cgram[i]);
+            snprintf(buf, bufsz, "cgram $%02X rom=%04X native=%04X", i, sn->ppu->cgram[i], p->cgram[i]);
     for (int i = 0; i < 0x100; i++)
         if (!VMASKED(0x8100 + i) && sn->ppu->oam[i] != p->oam[i] && n++ == 0)
-            snprintf(buf, sizeof(buf), "oam word $%02X rom=%04X native=%04X", i, sn->ppu->oam[i], p->oam[i]);
+            snprintf(buf, bufsz, "oam word $%02X rom=%04X native=%04X", i, sn->ppu->oam[i], p->oam[i]);
     for (int i = 0; i < 0x20; i++)
         if (!VMASKED(0x8200 + i) && sn->ppu->highOam[i] != p->hoam[i] && n++ == 0)
-            snprintf(buf, sizeof(buf), "high oam $%02X rom=%02X native=%02X", i, sn->ppu->highOam[i], p->hoam[i]);
+            snprintf(buf, bufsz, "high oam $%02X rom=%02X native=%02X", i, sn->ppu->highOam[i], p->hoam[i]);
     for (int i = 0; i < 0x300; i++) {
         if (p->nio_set[i] == p->gio_set[i] && (!p->nio_set[i] || p->nio[i] == p->gio[i])) continue;
         unsigned reg = i < 0x100 ? 0x2100 + i : 0x4200 + (i - 0x100);
         if (n++ == 0)
-            snprintf(buf, sizeof(buf), "io $%04X rom=%s%02X native=%s%02X", reg,
+            snprintf(buf, bufsz, "io $%04X rom=%s%02X native=%s%02X", reg,
                      p->gio_set[i] ? "" : "unwritten/", p->gio[i],
                      p->nio_set[i] ? "" : "unwritten/", p->nio[i]);
     }
 #undef VMASKED
+    return n;
+}
+
+static void record_fail(Pending *p, const char *what, int n) {
+    Snes *sn = snesrecomp_get_snes();
+    Validate *v = &s_val[p->idx];
+    v->mem_fail++;
+    if (!v->first[0]) {
+        if (p->frames)
+            snprintf(v->first, sizeof(v->first), "call %lu, frame %u (after %u frames in it): %s (%d differ)",
+                     v->calls, sn->frames, p->frames, what, n);
+        else
+            snprintf(v->first, sizeof(v->first), "call %lu, frame %u: %s (%d differ)", v->calls, sn->frames, what, n);
+    }
+}
+
+static void validate_compare(Cpu *c, Pending *p) {
+    Validate *v = &s_val[p->idx];
+    char buf[200];
+    int n = validate_diff(p, buf, sizeof(buf));
+    if (p->irq_hit) v->irq++;
     v->calls++;
     if (n) {
-        v->mem_fail++;
-        if (!v->first[0])
-            snprintf(v->first, sizeof(v->first), "call %lu, frame %u: %s (%d differ)", v->calls, sn->frames, buf, n);
+        record_fail(p, buf, n);
     } else if (c->a != p->a || c->x != p->x || c->y != p->y || c->db != p->db || c->dp != p->dp ||
                c->c != p->c || c->z != p->z || c->n != p->n || c->v != p->v ||
                c->mf != p->mf || c->xf != p->xf) {
@@ -610,6 +697,178 @@ static void validate_compare(Cpu *c, Pending *p) {
                      "rom A=%04X X=%04X Y=%04X C%d Z%d N%d V%d M%d X%d / native A=%04X X=%04X Y=%04X C%d Z%d N%d V%d M%d X%d",
                      c->a, c->x, c->y, c->c, c->z, c->n, c->v, c->mf, c->xf,
                      p->a, p->x, p->y, p->c, p->z, p->n, p->v, p->mf, p->xf);
+    }
+}
+
+/* The native body of p, on its own stack: started, or resumed after a frame. */
+static Pending *s_co_cur = NULL;
+
+#ifdef _WIN32
+static void WINAPI co_entry(LPVOID arg) {
+    Pending *p = (Pending *)arg;
+    p->fn();
+    p->co_yielded = false;
+    SwitchToFiber(p->co.ret);
+}
+#else
+static void co_entry(void) {
+    Pending *p = s_co_cur;
+    p->fn();
+    p->co_yielded = false;
+    swapcontext(&p->co.uc, &p->co.ret);
+}
+#endif
+
+static void co_start(Pending *p) {
+#ifdef _WIN32
+    if (!s_main_fiber) s_main_fiber = ConvertThreadToFiber(NULL);
+    if (p->co.fiber) DeleteFiber(p->co.fiber);
+    p->co.fiber = CreateFiber(CO_STACK, co_entry, p);
+#else
+    if (!p->co.stack) p->co.stack = (char *)malloc(CO_STACK);
+    getcontext(&p->co.uc);
+    p->co.uc.uc_stack.ss_sp = p->co.stack;
+    p->co.uc.uc_stack.ss_size = CO_STACK;
+    p->co.uc.uc_link = NULL;
+    makecontext(&p->co.uc, co_entry, 0);
+#endif
+}
+
+static void co_switch_in(Pending *p) {
+    s_co_cur = p;
+#ifdef _WIN32
+    p->co.ret = GetCurrentFiber();
+    SwitchToFiber(p->co.fiber);
+#else
+    swapcontext(&p->co.ret, &p->co.uc);
+#endif
+    s_co_cur = NULL;
+}
+
+/* Called by func_table dispatch while a native body under check calls addr.
+ * A registered frame driver suspends the body (true: the caller then
+ * continues as if the driver had returned, with what the genuine one
+ * returned). */
+static bool intercept_frame_call(uint32_t snes_addr);
+bool recomp_validate_frame_call(uint32_t snes_addr) {
+    Pending *p = s_co_cur;
+    if (!p) return intercept_frame_call(snes_addr);
+    if (!frame_driver(snes_addr)) return false;
+    p->co_yielded = true;
+    p->fd_addr = snes_addr;
+    p->native_s = g_cpu.S;
+#ifdef _WIN32
+    SwitchToFiber(p->co.ret);
+#else
+    swapcontext(&p->co.uc, &p->co.ret);
+#endif
+    return true;
+}
+
+/* Run (resume = false: start) the native body on the live machine until it
+ * ends or waits for a frame; keep what it produced in p and put the machine
+ * back. False if the piece cannot be checked: it exits by a jump, presents a
+ * frame itself, or falls back to the interpreter for a callee. */
+static bool run_native(Cpu *c, Pending *p, bool resume) {
+    Snes *sn = snesrecomp_get_snes();
+    int size = snes_saveState(sn, s_state_buf);
+    s_native_cap = p;
+    unsigned long interp_before = s_interp_calls;
+    sync_from_lake(c);
+    if (resume) g_cpu.S = p->native_s;          /* its call_jsl/call_jsr undo their own frame */
+    else co_start(p);
+    s_redirect = 0xFFFFFFFFu;
+    s_timed_depth++;
+    g_recomp_validating = true;
+    g_recomp_frame_touched = false;
+    p->co_yielded = false;
+    co_switch_in(p);
+    g_recomp_validating = false;
+    s_native_cap = NULL;
+    s_timed_depth--;
+    sync_to_lake(c);
+    bool ok = s_redirect == 0xFFFFFFFFu && !g_recomp_frame_touched && s_interp_calls == interp_before;
+    s_redirect = 0xFFFFFFFFu;
+    memcpy(p->ram, sn->ram, 0x20000);
+    memcpy(p->vram, sn->ppu->vram, 0x10000);
+    memcpy(p->cgram, sn->ppu->cgram, 0x200);
+    memcpy(p->oam, sn->ppu->oam, 0x200);
+    memcpy(p->hoam, sn->ppu->highOam, 0x20);
+    p->a = c->a; p->x = c->x; p->y = c->y; p->dp = c->dp; p->db = c->db;
+    p->c = c->c; p->z = c->z; p->n = c->n; p->v = c->v; p->mf = c->mf; p->xf = c->xf;
+    /* A body that ended on another stack (LDA saved; TCS; RTS: leave a game
+     * loop) returns where that stack says, as the intercept's simulated
+     * RTS/RTL takes it: the genuine routine is compared there. */
+    if (!p->co_yielded && c->sp != p->entry_sp) {
+        uint16_t sp = c->sp;
+        uint16_t ret = (uint16_t)(p->ram[(uint16_t)(sp + 1)] | (p->ram[(uint16_t)(sp + 2)] << 8));
+        bool is_long = s_val[p->idx].is_long;
+        p->pc = (uint16_t)(ret + 1);
+        p->k  = is_long ? p->ram[(uint16_t)(sp + 3)] : c->k;
+        p->sp = (uint16_t)(sp + (is_long ? 3 : 2));
+    }
+    if (!snes_loadState(sn, s_state_buf, size)) {
+        fprintf(stderr, "validate: state restore failed (size %d)\\n", size);
+        abort();
+    }
+    return ok;
+}
+
+/* A fresh piece starts from the machine as it is now: forget what the last
+ * one saw (interrupts, register writes). */
+static void reset_piece(Pending *p) {
+    p->irq_hit = 0;
+    memset(p->irq_mask, 0, 0x20000 / 8);
+    memset(p->irq_vmask, 0, (IRQ_V_BITS + 7) / 8);
+    memset(p->nio_set, 0, sizeof(p->nio_set));
+    memset(p->gio_set, 0, sizeof(p->gio_set));
+}
+
+/* Frame bookkeeping for routines under check, at each genuine opcode. */
+static void validate_frames(Cpu *c, uint32_t pc) {
+    const FrameDriver *fd = frame_driver(pc);
+    if (fd && !s_irq_active) {
+        /* The genuine code enters a frame driver: for every routine it runs
+         * inside, this is the next frame. */
+        for (int k = 0; k < s_pend_n; k++) {
+            Pending *p = &s_pend[k];
+            if (c->sp >= p->entry_sp || (p->phase != PH_SEG && p->phase != PH_FINAL)) continue;
+            Validate *v = &s_val[p->idx];
+            if (p->phase == PH_FINAL) {
+                v->calls++;
+                record_fail(p, "the ROM waits for a frame here, the native body had already returned", 1);
+                p->phase = PH_DONE;
+                continue;
+            }
+            char buf[200], what[260];
+            int n = validate_diff(p, buf, sizeof(buf));
+            if (p->fd_addr != pc) {
+                snprintf(what, sizeof(what), "ROM frame driver $%06X, native $%06X", pc, p->fd_addr);
+                v->calls++; record_fail(p, what, 1); p->phase = PH_DONE;
+            } else if (n) {
+                snprintf(what, sizeof(what), "before frame driver $%06X: %s", pc, buf);
+                v->calls++; record_fail(p, what, n); p->phase = PH_DONE;
+            } else {
+                uint16_t sp = c->sp;
+                uint16_t ret = (uint16_t)(bus_read8(0x00, (sp + 1) & 0xFFFF) | (bus_read8(0x00, (sp + 2) & 0xFFFF) << 8));
+                p->ret_pc = (uint16_t)(ret + 1);
+                p->ret_k  = fd->is_long ? bus_read8(0x00, (sp + 3) & 0xFFFF) : c->k;
+                p->ret_sp = (uint16_t)(sp + (fd->is_long ? 3 : 2));
+                p->phase = PH_FRAME;
+            }
+        }
+        return;
+    }
+    /* A genuine frame driver returned: those routines' native bodies go on
+     * from here, on the machine the frame left. */
+    for (int k = 0; k < s_pend_n; k++) {
+        Pending *p = &s_pend[k];
+        if (p->phase != PH_FRAME || c->k != p->ret_k || c->pc != p->ret_pc || c->sp != p->ret_sp) continue;
+        p->frames++;
+        s_val[p->idx].frames++;
+        reset_piece(p);
+        if (!run_native(c, p, true)) { s_val[p->idx].skipped++; p->phase = PH_DONE; continue; }
+        p->phase = p->co_yielded ? PH_SEG : PH_FINAL;
     }
 }
 
@@ -675,11 +934,21 @@ static bool validate_hook(Cpu *c) {
      * past its return frame without coming back through it (it popped its own
      * return address, as jump-table dispatchers do), there is no comparison
      * point: drop it as skipped. */
+    if (s_fd_n && s_pend_n > 0) validate_frames(c, pc);
     while (s_pend_n > 0) {
         Pending *p = &s_pend[s_pend_n - 1];
-        if (c->k == p->k && c->pc == p->pc && c->sp == p->sp) validate_compare(c, p);
-        else if (c->sp > p->sp) s_val[p->idx].skipped++;
-        else break;
+        bool back = c->k == p->k && c->pc == p->pc && c->sp == p->sp;
+        if (!back && c->sp <= p->sp) break;
+        if (p->phase == PH_DONE) {
+            /* already counted */
+        } else if (!back || p->phase == PH_FRAME) {
+            s_val[p->idx].skipped++;
+        } else if (p->phase == PH_SEG) {
+            s_val[p->idx].calls++;
+            record_fail(p, "the native body waits for a frame, the ROM routine returned", 1);
+        } else {
+            validate_compare(c, p);
+        }
         s_pend_n--;
         if (s_pend_n == 0 && c->write == genuine_write) c->write = s_genuine_write;
     }
@@ -723,43 +992,133 @@ static bool validate_hook(Cpu *c) {
     p->k  = v->is_long ? bus_read8(0x00, (sp + 3) & 0xFFFF) : c->k;
     p->sp = (uint16_t)(sp + (v->is_long ? 3 : 2));
 
-    int size = snes_saveState(sn, s_state_buf);
     memset(p->nio_set, 0, sizeof(p->nio_set));
     memset(p->gio_set, 0, sizeof(p->gio_set));
-    s_native_cap = p;
-    unsigned long interp_before = s_interp_calls;
-    sync_from_lake(c);
-    s_redirect = 0xFFFFFFFFu;
-    s_timed_depth++;
-    g_recomp_validating = true;
-    g_recomp_frame_touched = false;
-    fn();
-    g_recomp_validating = false;
-    s_native_cap = NULL;
-    s_timed_depth--;
-    sync_to_lake(c);
-    /* Exits by jump, drives frames itself, or falls back to the (untimed)
-     * interpreter for a callee: not something that can be verified as a native
-     * body inside the timed loop, so the call is skipped. */
-    bool redirected = s_redirect != 0xFFFFFFFFu || g_recomp_frame_touched ||
-                      s_interp_calls != interp_before;
-    s_redirect = 0xFFFFFFFFu;
-    memcpy(p->ram, sn->ram, 0x20000);
-    memcpy(p->vram, sn->ppu->vram, 0x10000);
-    memcpy(p->cgram, sn->ppu->cgram, 0x200);
-    memcpy(p->oam, sn->ppu->oam, 0x200);
-    memcpy(p->hoam, sn->ppu->highOam, 0x20);
-    p->a = c->a; p->x = c->x; p->y = c->y; p->dp = c->dp; p->db = c->db;
-    p->c = c->c; p->z = c->z; p->n = c->n; p->v = c->v; p->mf = c->mf; p->xf = c->xf;
-    if (!snes_loadState(sn, s_state_buf, size)) {
-        fprintf(stderr, "validate: state restore failed at $%06X (size %d)\n", pc, size);
-        abort();
-    }
-
-    if (redirected) { v->skipped++; return true; }
+    p->fn = fn;
+    p->frames = 0;
+    p->phase = PH_FINAL;
+    if (!run_native(c, p, false)) { v->skipped++; return true; }
+    p->phase = p->co_yielded ? PH_SEG : PH_FINAL;
     s_pend_n++;
     if (c->write != genuine_write) { s_genuine_write = c->write; c->write = genuine_write; }
     return true;
+}
+
+/* ---- Frame-driving native bodies in the timed loop -----------------------
+ *
+ * An intercepted body marked framed (recomp_timed_add_framed_intercept) runs
+ * on a stack of its own. When it calls a registered frame driver it is
+ * suspended, and the timed CPU runs the genuine driver instead, as if the
+ * body had executed the JSL: its registers go to the CPU and the return frame
+ * is pushed where the body's S says. The return address is the driver's own
+ * entry (as a JSL there would push it); when the CPU comes back to it at that
+ * stack depth the hook resumes the body, with the registers the driver
+ * returned, before anything runs there. */
+typedef struct {
+    CoCtx co;
+    snes_func_t fn;
+    const TimedIntercept *e;
+    bool yielded;
+    uint32_t fd_addr;
+    uint16_t native_s;
+    uint8_t land_k; uint16_t land_pc, land_sp;
+} InterceptCo;
+#define ICO_DEPTH 8
+static InterceptCo  s_ico[ICO_DEPTH];
+static int          s_ico_n = 0;
+static InterceptCo *s_ico_cur = NULL;
+
+#ifdef _WIN32
+static void WINAPI ico_entry(LPVOID arg) {
+    InterceptCo *t = (InterceptCo *)arg;
+    t->fn();
+    t->yielded = false;
+    SwitchToFiber(t->co.ret);
+}
+#else
+static void ico_entry(void) {
+    InterceptCo *t = s_ico_cur;
+    t->fn();
+    t->yielded = false;
+    swapcontext(&t->co.uc, &t->co.ret);
+}
+#endif
+
+static bool intercept_frame_call(uint32_t snes_addr) {
+    InterceptCo *t = s_ico_cur;
+    if (!t || !frame_driver(snes_addr)) return false;
+    t->yielded = true;
+    t->fd_addr = snes_addr;
+    t->native_s = g_cpu.S;
+#ifdef _WIN32
+    SwitchToFiber(t->co.ret);
+#else
+    swapcontext(&t->co.uc, &t->co.ret);
+#endif
+    return true;
+}
+
+static void ico_run(InterceptCo *t) {
+    InterceptCo *outer = s_ico_cur;
+    s_ico_cur = t;
+    t->yielded = false;
+#ifdef _WIN32
+    t->co.ret = GetCurrentFiber();
+    SwitchToFiber(t->co.fiber);
+#else
+    swapcontext(&t->co.ret, &t->co.uc);
+#endif
+    s_ico_cur = outer;
+}
+
+static void intercept_finish(Cpu *c, const TimedIntercept *e);
+
+/* After a framed body ran (started or resumed): send the CPU into the frame
+ * driver it waits for, or finish the call. */
+static void ico_after(Cpu *c, InterceptCo *t) {
+    sync_to_lake(c);
+    if (!t->yielded) {
+        s_ico_n--;
+        intercept_finish(c, t->e);
+        return;
+    }
+    const FrameDriver *fd = frame_driver(t->fd_addr);
+    uint16_t sp = t->native_s;
+    uint16_t ret = (uint16_t)(t->fd_addr - 1);
+    if (fd->is_long) {
+        bus_write8(0x00, (uint16_t)(sp + 3), (uint8_t)(t->fd_addr >> 16));
+        bus_write8(0x00, (uint16_t)(sp + 2), (uint8_t)(ret >> 8));
+        bus_write8(0x00, (uint16_t)(sp + 1), (uint8_t)ret);
+    } else {
+        bus_write8(0x00, (uint16_t)(sp + 2), (uint8_t)(ret >> 8));
+        bus_write8(0x00, (uint16_t)(sp + 1), (uint8_t)ret);
+    }
+    t->land_k = (uint8_t)(t->fd_addr >> 16);
+    t->land_pc = (uint16_t)t->fd_addr;
+    t->land_sp = (uint16_t)(sp + (fd->is_long ? 3 : 2));
+    c->sp = sp;
+    c->k = (uint8_t)(t->fd_addr >> 16);
+    c->pc = (uint16_t)t->fd_addr;
+}
+
+/* A suspended body whose frame driver just returned? Resume it. */
+static bool ico_resume(Cpu *c) {
+    for (int i = s_ico_n - 1; i >= 0; i--) {
+        InterceptCo *t = &s_ico[i];
+        if (!t->yielded || c->k != t->land_k || c->pc != t->land_pc || c->sp != t->land_sp) continue;
+        if (i != s_ico_n - 1) {
+            fprintf(stderr, "recomp: framed body $%06X resumed out of order\n", t->e->addr);
+            abort();
+        }
+        sync_from_lake(c);
+        g_cpu.S = t->native_s;
+        s_timed_depth++;
+        ico_run(t);
+        s_timed_depth--;
+        ico_after(c, t);
+        return true;
+    }
+    return false;
 }
 
 static bool timed_recomp_hook(Cpu *c) {
@@ -778,6 +1137,7 @@ static bool timed_recomp_hook(Cpu *c) {
         }
     }
 
+    if (s_ico_n && ico_resume(c)) return true;
     if (s_val_n && validate_hook(c)) return false;   /* genuine routine runs */
 
     uint32_t pc = ((uint32_t)c->k << 16) | (uint16_t)c->pc;
@@ -798,10 +1158,38 @@ static bool timed_recomp_hook(Cpu *c) {
 
     sync_from_lake(c);   /* LakeSnes CPU regs -> g_cpu (native body reads these) */
     s_redirect = 0xFFFFFFFFu;
+    if (e->framed && s_fd_n && s_ico_n < ICO_DEPTH) {
+        InterceptCo *t = &s_ico[s_ico_n++];
+        t->fn = fn;
+        t->e = e;
+#ifdef _WIN32
+        if (!s_main_fiber) s_main_fiber = ConvertThreadToFiber(NULL);
+        if (t->co.fiber) DeleteFiber(t->co.fiber);
+        t->co.fiber = CreateFiber(CO_STACK, ico_entry, t);
+#else
+        if (!t->co.stack) t->co.stack = (char *)malloc(CO_STACK);
+        getcontext(&t->co.uc);
+        t->co.uc.uc_stack.ss_sp = t->co.stack;
+        t->co.uc.uc_stack.ss_size = CO_STACK;
+        t->co.uc.uc_link = NULL;
+        makecontext(&t->co.uc, ico_entry, 0);
+#endif
+        s_timed_depth++;
+        ico_run(t);
+        s_timed_depth--;
+        ico_after(c, t);
+        return true;
+    }
     s_timed_depth++;
     fn();                /* run recompiled native body (g_cpu + recomp bus) */
     s_timed_depth--;
     sync_to_lake(c);     /* g_cpu -> LakeSnes CPU regs */
+    intercept_finish(c, e);
+    return true;
+}
+
+/* The end of an intercepted call: a redirect, or the simulated RTS/RTL. */
+static void intercept_finish(Cpu *c, const TimedIntercept *e) {
 
     /* JMP/JML exit: the function redirected instead of returning. Set PB:PC to
      * the target without popping the stack (matches the original jump). */
@@ -810,7 +1198,7 @@ static bool timed_recomp_hook(Cpu *c) {
         c->k  = (uint8_t)(s_redirect >> 16);
         s_redirect = 0xFFFFFFFFu;
         s_intercept_hits++;
-        return true;
+        return;
     }
 
     /* Optional cycle accounting: advance the timed clock by the original
@@ -836,7 +1224,6 @@ static bool timed_recomp_hook(Cpu *c) {
         c->sp = (uint16_t)((sp + 2) & 0xFFFF);
     }
     s_intercept_hits++;
-    return true;
 }
 
 void recomp_timed_recomp_enable(void)  { g_cpuRecompHook = timed_recomp_hook; }

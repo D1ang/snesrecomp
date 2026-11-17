@@ -106,4 +106,25 @@ void recomp_timed_profile_dump(int top);
  * timed-recomp hook will transfer control to snes_addr (no stack pop). */
 void recomp_set_redirect(uint32_t snes_addr);
 
+/*
+ * Frame drivers for lockstep validation (recomp_timed_add_validate). A native
+ * body under check that calls one of these through func_table_call(_jsr) is
+ * suspended at that call instead of presenting a frame; the genuine routine
+ * runs until it enters a frame driver too, the machine is compared there, the
+ * genuine driver runs the frame, and the native body resumes after it. So
+ * routines that wait for frames (menus, fades, game loops) can be checked
+ * piece by piece. Without any registered driver nothing changes: a native
+ * body that presents a frame is counted as skipped, as before.
+ * is_long: the driver is entered by JSL (returns with RTL).
+ */
+void recomp_timed_add_frame_driver(uint32_t snes_addr, bool is_long);
+/* An intercept (recomp_timed_add_intercept) whose native body calls frame
+ * drivers: it runs on its own stack and is suspended at each such call while
+ * the timed CPU runs the genuine driver, then resumed. Ordinary intercepts
+ * stay on the C stack (cheaper); a body that presents a frame there would do
+ * it from C, outside the timed frame. */
+void recomp_timed_add_framed_intercept(uint32_t snes_addr, bool is_long);
+/* Internal: func_table dispatch asks whether a call suspends the body. */
+bool recomp_validate_frame_call(uint32_t snes_addr);
+
 #endif /* SNESRECOMP_FUNC_TABLE_H */
