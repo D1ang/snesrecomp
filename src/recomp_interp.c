@@ -519,6 +519,7 @@ typedef struct {
     unsigned long calls, mem_fail, reg_fail, skipped, mx_fail;
     unsigned long irq;   /* calls an NMI/IRQ handler interrupted */
     unsigned long frames;   /* frames waited for inside checked calls */
+    unsigned long irqdep;   /* calls not comparable: an interrupt changed WRAM the native body read */
     char first[200];
     char first_reg[160];
 } Validate;
@@ -545,6 +546,7 @@ typedef struct {
     uint16_t native_s;                    /* its S there (native view) */
     uint8_t ret_k; uint16_t ret_pc, ret_sp;   /* where the genuine driver returns */
     unsigned frames;                      /* frames passed so far */
+    uint8_t *read_mask;                   /* WRAM the native body read (bit per byte) */
 } Pending;
 enum { PH_FINAL,      /* native body ended: compare at the routine's return */
        PH_SEG,        /* native waits at a frame driver: compare when the ROM enters one */
@@ -621,8 +623,8 @@ void recomp_timed_add_validate(uint32_t snes_addr, bool is_long) {
 void recomp_timed_validate_report(void) {
     for (int i = 0; i < s_val_n; i++) {
         Validate *v = &s_val[i];
-        fprintf(stderr, "VALIDATE %06X calls=%lu mem_fail=%lu reg_fail=%lu mx_fail=%lu skipped=%lu irq=%lu frames=%lu%s%s%s%s\n",
-                v->addr, v->calls, v->mem_fail, v->reg_fail, v->mx_fail, v->skipped, v->irq, v->frames,
+        fprintf(stderr, "VALIDATE %06X calls=%lu mem_fail=%lu reg_fail=%lu mx_fail=%lu skipped=%lu irq=%lu frames=%lu irqdep=%lu%s%s%s%s\n",
+                v->addr, v->calls, v->mem_fail, v->reg_fail, v->mx_fail, v->skipped, v->irq, v->frames, v->irqdep,
                 v->first[0] ? " first: " : "", v->first,
                 v->first_reg[0] ? " | reg: " : "", v->first_reg);
     }
@@ -680,10 +682,22 @@ static void record_fail(Pending *p, const char *what, int n) {
     }
 }
 
+/* Did an interrupt that landed in the genuine call write WRAM the native body
+ * read? Then the genuine routine may have acted on the handler's value (a
+ * mouse button, a frame counter) that the native body, run beforehand,
+ * could not see: the call is not comparable. */
+static bool irq_read_overlap(const Pending *p) {
+    if (!p->irq_hit) return false;
+    for (int i = 0; i < 0x20000 / 8; i++)
+        if (p->irq_mask[i] & p->read_mask[i]) return true;
+    return false;
+}
+
 static void validate_compare(Cpu *c, Pending *p) {
     Validate *v = &s_val[p->idx];
     char buf[200];
     int n = validate_diff(p, buf, sizeof(buf));
+    if (n && irq_read_overlap(p)) { v->irqdep++; return; }
     if (p->irq_hit) v->irq++;
     v->calls++;
     if (n) {
@@ -703,6 +717,7 @@ static void validate_compare(Cpu *c, Pending *p) {
 
 /* The native body of p, on its own stack: started, or resumed after a frame. */
 static Pending *s_co_cur = NULL;
+extern uint8_t *g_bus_read_mark;   /* bus.c */
 
 #ifdef _WIN32
 static void WINAPI co_entry(LPVOID arg) {
@@ -783,7 +798,9 @@ static bool run_native(Cpu *c, Pending *p, bool resume) {
     g_recomp_validating = true;
     g_recomp_frame_touched = false;
     p->co_yielded = false;
+    g_bus_read_mark = p->read_mask;
     co_switch_in(p);
+    g_bus_read_mark = NULL;
     g_recomp_validating = false;
     s_native_cap = NULL;
     s_timed_depth--;
@@ -819,6 +836,7 @@ static bool run_native(Cpu *c, Pending *p, bool resume) {
  * one saw (interrupts, register writes). */
 static void reset_piece(Pending *p) {
     p->irq_hit = 0;
+    memset(p->read_mask, 0, 0x20000 / 8);
     memset(p->irq_mask, 0, 0x20000 / 8);
     memset(p->irq_vmask, 0, (IRQ_V_BITS + 7) / 8);
     memset(p->nio_set, 0, sizeof(p->nio_set));
@@ -846,6 +864,8 @@ static void validate_frames(Cpu *c, uint32_t pc) {
             if (p->fd_addr != pc) {
                 snprintf(what, sizeof(what), "ROM frame driver $%06X, native $%06X", pc, p->fd_addr);
                 v->calls++; record_fail(p, what, 1); p->phase = PH_DONE;
+            } else if (n && irq_read_overlap(p)) {
+                v->irqdep++; p->phase = PH_DONE;
             } else if (n) {
                 snprintf(what, sizeof(what), "before frame driver $%06X: %s", pc, buf);
                 v->calls++; record_fail(p, what, n); p->phase = PH_DONE;
@@ -984,7 +1004,9 @@ static bool validate_hook(Cpu *c) {
         p->hoam = (uint8_t *)malloc(0x20);
         p->irq_mask = (uint8_t *)malloc(0x20000 / 8);
         p->irq_vmask = (uint8_t *)malloc((IRQ_V_BITS + 7) / 8);
+        p->read_mask = (uint8_t *)malloc(0x20000 / 8);
     }
+    memset(p->read_mask, 0, 0x20000 / 8);
     p->irq_hit = 0;
     memset(p->irq_mask, 0, 0x20000 / 8);
     memset(p->irq_vmask, 0, (IRQ_V_BITS + 7) / 8);

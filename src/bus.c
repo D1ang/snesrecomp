@@ -45,9 +45,20 @@ void recomp_tick(int cycles) {
 
 extern void recomp_validate_note_write(uint32_t adr, uint8_t val);
 
+/* Lockstep validation: while set, every WRAM byte native code reads is
+ * marked here (bit per WRAM offset), see recomp_interp.c. */
+uint8_t *g_bus_read_mark = NULL;
+static inline void mark_wram_read(uint32_t off) {
+    g_bus_read_mark[(off & 0x1FFFF) >> 3] |= (uint8_t)(1u << (off & 7));
+}
+
 uint8_t bus_read8(uint8_t bank, uint16_t addr) {
     Snes *snes = snesrecomp_get_snes();
     if (!snes) return 0;
+    if (g_bus_read_mark) {
+        if (bank == 0x7E || bank == 0x7F) mark_wram_read(((uint32_t)(bank - 0x7E) << 16) | addr);
+        else if (!(bank & 0x40) && addr < 0x2000) mark_wram_read(addr);
+    }
     uint32_t flat = ((uint32_t)bank << 16) | addr;
     return snes_read(snes, flat);
 }
@@ -130,6 +141,7 @@ void bus_write16(uint8_t bank, uint16_t addr, uint16_t val) {
 uint8_t bus_wram_read8(uint32_t offset) {
     Snes *snes = snesrecomp_get_snes();
     if (!snes) return 0;
+    if (g_bus_read_mark) mark_wram_read(offset);
     return snes->ram[offset & 0x1FFFF];
 }
 
