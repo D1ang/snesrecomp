@@ -70,6 +70,7 @@ add_library(snesrecomp STATIC
     src/snesrecomp.c
     src/cpu.c
     src/bus.c
+    src/romlog.c
     src/func_table.c
     src/recomp_interp.c
     src/platform_sdl.c

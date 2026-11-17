@@ -48,6 +48,10 @@ extern void recomp_validate_note_write(uint32_t adr, uint8_t val);
 /* Lockstep validation: while set, every WRAM byte native code reads is
  * marked here (bit per WRAM offset), see recomp_interp.c. */
 uint8_t *g_bus_read_mark = NULL;
+
+extern bool g_romlog_on;
+void romlog_note_native(uint32_t adr);
+void romlog_note_write(uint32_t adr, uint8_t val);
 static inline void mark_wram_read(uint32_t off) {
     g_bus_read_mark[(off & 0x1FFFF) >> 3] |= (uint8_t)(1u << (off & 7));
 }
@@ -60,6 +64,7 @@ uint8_t bus_read8(uint8_t bank, uint16_t addr) {
         else if (!(bank & 0x40) && addr < 0x2000) mark_wram_read(addr);
     }
     uint32_t flat = ((uint32_t)bank << 16) | addr;
+    if (g_romlog_on) romlog_note_native(flat);   /* ROM access log (romlog.c) */
     return snes_read(snes, flat);
 }
 
@@ -67,6 +72,7 @@ void bus_write8(uint8_t bank, uint16_t addr, uint8_t val) {
     Snes *snes = snesrecomp_get_snes();
     if (!snes) return;
     uint32_t flat = ((uint32_t)bank << 16) | addr;
+    if (g_romlog_on) romlog_note_write(flat, val);
     snes_write(snes, flat, val);
     recomp_validate_note_write(flat, val);   /* lockstep validation: register writes */
 

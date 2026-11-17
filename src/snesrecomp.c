@@ -170,6 +170,7 @@ bool snesrecomp_load_rom(const char *path) {
     snes_setPixels(s_snes, s_pixel_buf);
 
     printf("snesrecomp: ROM loaded successfully\n");
+    { extern void romlog_init(uint32_t rom_size); romlog_init((uint32_t)size); }
     return true;
 }
 
