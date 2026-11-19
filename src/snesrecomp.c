@@ -9,6 +9,7 @@
 #include "snesrecomp/mp_session.h"
 #include "snes.h"
 #include "ppu.h"
+#include "cart.h"
 #include "input.h"
 
 #include <stdio.h>
@@ -128,6 +129,39 @@ bool snesrecomp_init(const char *window_title, int scale) {
     return true;
 }
 
+/* Battery RAM to and from a file, for test tours that start from a saved
+ * game: SNESRECOMP_SRAM_LOAD=<file> fills SRAM after the ROM is loaded,
+ * SNESRECOMP_SRAM_DUMP=<file> writes it at exit. */
+static char s_sram_dump[512];
+static void sram_dump_at_exit(void) {
+    Snes *sn = snesrecomp_get_snes();
+    if (!sn || !sn->cart || !sn->cart->ram || !sn->cart->ramSize) return;
+    FILE *f = fopen(s_sram_dump, "wb");
+    if (!f) return;
+    fwrite(sn->cart->ram, 1, sn->cart->ramSize, f);
+    fclose(f);
+}
+static void sram_files_init(void) {
+    Snes *sn = snesrecomp_get_snes();
+    if (!sn || !sn->cart || !sn->cart->ram || !sn->cart->ramSize) return;
+    const char *in = getenv("SNESRECOMP_SRAM_LOAD");
+    if (in && *in) {
+        FILE *f = fopen(in, "rb");
+        if (f) {
+            size_t n = fread(sn->cart->ram, 1, sn->cart->ramSize, f);
+            fclose(f);
+            fprintf(stderr, "snesrecomp: SRAM loaded from %s (%zu bytes)\n", in, n);
+        } else {
+            fprintf(stderr, "snesrecomp: cannot read SRAM file %s\n", in);
+        }
+    }
+    const char *out = getenv("SNESRECOMP_SRAM_DUMP");
+    if (out && *out) {
+        snprintf(s_sram_dump, sizeof s_sram_dump, "%s", out);
+        atexit(sram_dump_at_exit);
+    }
+}
+
 bool snesrecomp_load_rom(const char *path) {
     if (!s_snes) return false;
 
@@ -171,6 +205,7 @@ bool snesrecomp_load_rom(const char *path) {
 
     printf("snesrecomp: ROM loaded successfully\n");
     { extern void romlog_init(uint32_t rom_size); romlog_init((uint32_t)size); }
+    sram_files_init();
     return true;
 }
 
