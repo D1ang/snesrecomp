@@ -6,6 +6,7 @@
  */
 
 #include "snesrecomp/input.h"
+#include "snesrecomp/bus.h"
 #include "snesrecomp/menu_overlay.h"
 #include "snesrecomp/platform.h"
 #include "snes.h"
@@ -276,10 +277,47 @@ bool recomp_input_mouse_script_active(void) {
     return s_mstep_count > 0;
 }
 
+/* Memory pokes on the mouse script's frame clock, for test tours that need
+ * a game state the script cannot reach by clicking (a later level, say):
+ *   SNESRECOMP_POKE="frame:BBAAAA=VV ..."   one byte, all hex but frame.
+ * Applied at the start of that frame, before the game runs it, in every mode
+ * alike (genuine, native, validated), so a check stays a fair comparison. */
+#define POKE_MAX 256
+typedef struct { int frame; uint8_t bank; uint16_t addr; uint8_t val; } Poke;
+static Poke s_pokes[POKE_MAX];
+static int  s_poke_count = -1;
+
+static void pokes_parse(void) {
+    s_poke_count = 0;
+    const char *p = getenv("SNESRECOMP_POKE");
+    while (p && *p && s_poke_count < POKE_MAX) {
+        while (*p == ' ' || *p == ',') p++;
+        if (!*p) break;
+        unsigned frame, where, val;
+        int n = 0;
+        if (sscanf(p, "%u:%x=%x%n", &frame, &where, &val, &n) != 3 || n == 0) {
+            fprintf(stderr, "SNESRECOMP_POKE: cannot read \"%s\"\n", p);
+            break;
+        }
+        Poke *k = &s_pokes[s_poke_count++];
+        k->frame = (int)frame; k->bank = (uint8_t)(where >> 16);
+        k->addr = (uint16_t)where; k->val = (uint8_t)val;
+        p += n;
+    }
+}
+
+static void pokes_apply(int frame) {
+    if (s_poke_count < 0) pokes_parse();
+    for (int i = 0; i < s_poke_count; i++)
+        if (s_pokes[i].frame == frame)
+            bus_write8(s_pokes[i].bank, s_pokes[i].addr, s_pokes[i].val);
+}
+
 static void mouse_script_apply(SnesMouseState *ms) {
     if (!s_mscript_parsed) mouse_script_parse();
     if (!s_mstep_count) return;
     s_mscript_frame++;
+    pokes_apply(s_mscript_frame);
     for (int i = 0; i < s_mstep_count; i++) {
         const MouseStep *s = &s_msteps[i];
         if (s_mscript_frame >= s->frame && s_mscript_frame < s->frame + s->count) {
