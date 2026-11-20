@@ -47,8 +47,22 @@ static int32_t rom_off(uint32_t adr) {
     return (int32_t)((((uint32_t)bank << 15) | (a & 0x7FFF)) & (s_size - 1));
 }
 
+/* With an asset pack: reads of bytes the pack does not have. */
+extern const uint8_t *pack_have(uint32_t *size);
+static const uint8_t *s_have;
+static uint8_t *s_miss;
+static uint32_t *s_miss_who;
+static bool s_log;                    /* writing the access log (not only checking the pack) */
+
+static void miss(int32_t off, uint32_t who) {
+    if (!s_have || off < 0 || (uint32_t)off >= s_size || s_have[off] || s_miss[off]) return;
+    s_miss[off] = 1;
+    s_miss_who[off] = who;
+}
+
 static void mark(int32_t off, int k, uint32_t who) {
     if (off < 0 || (uint32_t)off >= s_size) return;
+    miss(off, who);
     uint8_t bit = (uint8_t)(1u << k);
     if (!(s_kind[off] & bit)) {
         s_kind[off] |= bit;
@@ -163,7 +177,7 @@ void romlog_note_write(uint32_t adr, uint8_t val) {
 
 void romlog_note_native(uint32_t adr) {
     int32_t off = rom_off(adr);
-    if (off >= 0 && (uint32_t)off < s_size) s_kind[off] |= K_NATIVE;
+    if (off >= 0 && (uint32_t)off < s_size) { s_kind[off] |= K_NATIVE; miss(off, 0xFFFFFF); }
 }
 
 static void romlog_cpuWrite(void *mem, uint32_t adr, uint8_t val) {
@@ -173,7 +187,29 @@ static void romlog_cpuWrite(void *mem, uint32_t adr, uint8_t val) {
 
 /* Binary dump, merged across runs by tools/rom_catalog.py:
  *   "MPRL" u32 size, u8 kind[size], u32 first[4][size] (little endian). */
+static void pack_report(void) {
+    if (!s_have) return;
+    const char *rp = getenv("SNESRECOMP_PACK_REPORT");
+    FILE *r = rp && *rp ? fopen(rp, "w") : NULL;
+    uint32_t total = 0, runs = 0;
+    for (uint32_t i = 0; i < s_size; ) {
+        if (!s_miss[i]) { i++; continue; }
+        uint32_t e = i;
+        while (e < s_size && s_miss[e]) e++;
+        total += e - i;
+        if (r) fprintf(r, "%06X %u %06X\n", i, e - i, s_miss_who[i]);
+        if (runs < 12)
+            fprintf(stderr, "pack: missing ROM offset $%06X, %u bytes (first read by $%06X)\n", i, e - i, s_miss_who[i]);
+        runs++;
+        i = e;
+    }
+    if (r) fclose(r);
+    fprintf(stderr, "pack: %u bytes read that the pack does not have, in %u runs\n", total, runs);
+}
+
 static void romlog_dump(void) {
+    pack_report();
+    if (!s_log) return;
     FILE *f = fopen(s_path, "wb");
     if (!f) return;
     fwrite("MPRL", 1, 4, f);
@@ -201,9 +237,17 @@ static void romlog_dump(void) {
 void romlog_init(uint32_t rom_size) {
     const char *p = getenv("SNESRECOMP_ROMLOG");
     Snes *sn = snesrecomp_get_snes();
-    if (!p || !*p || s_kind || !sn || !sn->cpu) return;
-    snprintf(s_path, sizeof s_path, "%s", p);
+    uint32_t hs = 0;
+    const uint8_t *have = pack_have(&hs);
+    s_log = p && *p;
+    if ((!s_log && !have) || s_kind || !sn || !sn->cpu) return;
+    snprintf(s_path, sizeof s_path, "%s", s_log ? p : "");
     s_size = rom_size;
+    if (have && hs == rom_size) {
+        s_have = have;
+        s_miss = calloc(rom_size, 1);
+        s_miss_who = calloc(rom_size, sizeof(uint32_t));
+    }
     s_kind = calloc(rom_size, 1);
     for (int k = 0; k < 4; k++) s_first[k] = calloc(rom_size, sizeof(uint32_t));
     s_read = sn->cpu->read;
@@ -212,5 +256,5 @@ void romlog_init(uint32_t rom_size) {
     sn->cpu->write = romlog_cpuWrite;
     g_romlog_on = true;
     atexit(romlog_dump);
-    fprintf(stderr, "romlog: logging ROM reads to %s\n", s_path);
+    if (s_log) fprintf(stderr, "romlog: logging ROM reads to %s\n", s_path);
 }

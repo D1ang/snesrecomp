@@ -165,6 +165,18 @@ static void sram_files_init(void) {
 bool snesrecomp_load_rom(const char *path) {
     if (!s_snes) return false;
 
+    /* An asset pack (a directory with pack.idx) instead of a ROM file */
+    extern bool pack_load(const char *path, uint8_t **out, long *out_size);
+    uint8_t *pdata; long psize;
+    long size = 0;
+    if (pack_load(path, &pdata, &psize)) {
+        size = psize;
+        bool pok = snes_loadRom(s_snes, pdata, (int)psize);
+        free(pdata);
+        if (!pok) { fprintf(stderr, "snesrecomp: LakeSnes rejected the pack's ROM image\n"); return false; }
+        goto loaded;
+    }
+
     /* Read ROM file into memory */
     FILE *f = fopen(path, "rb");
     if (!f) {
@@ -173,7 +185,7 @@ bool snesrecomp_load_rom(const char *path) {
     }
 
     fseek(f, 0, SEEK_END);
-    long size = ftell(f);
+    size = ftell(f);
     fseek(f, 0, SEEK_SET);
 
     uint8_t *data = malloc((size_t)size);
@@ -200,6 +212,7 @@ bool snesrecomp_load_rom(const char *path) {
         return false;
     }
 
+loaded:
     /* Re-point pixel output (reset clears it) */
     snes_setPixels(s_snes, s_pixel_buf);
 
