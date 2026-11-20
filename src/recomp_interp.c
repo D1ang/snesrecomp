@@ -543,6 +543,8 @@ typedef struct {
     CoCtx co;
     bool co_yielded;                      /* stopped at a frame driver (else ended) */
     uint32_t fd_addr;                     /* the driver it stopped at */
+    bool sync;                            /* stopped at a ROM sync point, not a driver */
+    uint32_t sync_pc;                     /* where the genuine routine meets it */
     uint16_t native_s;                    /* its S there (native view) */
     uint8_t ret_k; uint16_t ret_pc, ret_sp;   /* where the genuine driver returns */
     unsigned frames;                      /* frames passed so far */
@@ -551,6 +553,7 @@ typedef struct {
 enum { PH_FINAL,      /* native body ended: compare at the routine's return */
        PH_SEG,        /* native waits at a frame driver: compare when the ROM enters one */
        PH_FRAME,      /* genuine frame driver running: resume the native body when it returns */
+       PH_SYNC,       /* native waits at a ROM sync point: compare when the ROM reaches it */
        PH_DONE };     /* decided early (failed or skipped): nothing more to compare */
 #define VAL_DEPTH 8
 static Pending s_pend[VAL_DEPTH];
@@ -798,6 +801,7 @@ static bool run_native(Cpu *c, Pending *p, bool resume) {
     g_recomp_validating = true;
     g_recomp_frame_touched = false;
     p->co_yielded = false;
+    p->sync = false;
     g_bus_read_mark = p->read_mask;
     co_switch_in(p);
     g_bus_read_mark = NULL;
@@ -806,6 +810,10 @@ static bool run_native(Cpu *c, Pending *p, bool resume) {
     s_timed_depth--;
     sync_to_lake(c);
     bool ok = s_redirect == 0xFFFFFFFFu && !g_recomp_frame_touched && s_interp_calls == interp_before;
+    if (!ok && getenv("SNESRECOMP_VALIDATE_WHY"))
+        fprintf(stderr, "WHY $%06X skipped: redirect %06X, frame touched %d, interpreter calls %lu\n",
+                s_val[p->idx].addr, s_redirect == 0xFFFFFFFFu ? 0 : s_redirect, g_recomp_frame_touched,
+                s_interp_calls - interp_before);
     s_redirect = 0xFFFFFFFFu;
     memcpy(p->ram, sn->ram, 0x20000);
     memcpy(p->vram, sn->ppu->vram, 0x10000);
@@ -851,8 +859,14 @@ static void validate_frames(Cpu *c, uint32_t pc) {
          * inside, this is the next frame. */
         for (int k = 0; k < s_pend_n; k++) {
             Pending *p = &s_pend[k];
-            if (c->sp >= p->entry_sp || (p->phase != PH_SEG && p->phase != PH_FINAL)) continue;
+            if (c->sp >= p->entry_sp || (p->phase != PH_SEG && p->phase != PH_FINAL && p->phase != PH_SYNC)) continue;
             Validate *v = &s_val[p->idx];
+            if (p->phase == PH_SYNC) {
+                char what[120];
+                snprintf(what, sizeof(what), "the ROM waits for a frame here, the native body at sync point $%06X", p->sync_pc);
+                v->calls++; record_fail(p, what, 1); p->phase = PH_DONE;
+                continue;
+            }
             if (p->phase == PH_FINAL) {
                 v->calls++;
                 record_fail(p, "the ROM waits for a frame here, the native body had already returned", 1);
@@ -861,6 +875,11 @@ static void validate_frames(Cpu *c, uint32_t pc) {
             }
             char buf[200], what[260];
             int n = validate_diff(p, buf, sizeof(buf));
+            if (getenv("SNESRECOMP_VALIDATE_FTRACE"))
+                fprintf(stderr, "FTRACE $%06X frame %u: ROM driver $%06X from $%02X%04X, native $%06X, %d differ\n",
+                        s_val[p->idx].addr, p->frames, pc, fd->is_long ? bus_read8(0x00, (c->sp + 3) & 0xFFFF) : c->k,
+                        (unsigned)(bus_read8(0x00, (c->sp + 1) & 0xFFFF) | (bus_read8(0x00, (c->sp + 2) & 0xFFFF) << 8)),
+                        p->fd_addr, n);
             if (p->fd_addr != pc) {
                 snprintf(what, sizeof(what), "ROM frame driver $%06X, native $%06X", pc, p->fd_addr);
                 v->calls++; record_fail(p, what, 1); p->phase = PH_DONE;
@@ -889,7 +908,7 @@ static void validate_frames(Cpu *c, uint32_t pc) {
         s_val[p->idx].frames++;
         reset_piece(p);
         if (!run_native(c, p, true)) { s_val[p->idx].skipped++; p->phase = PH_DONE; continue; }
-        p->phase = p->co_yielded ? PH_SEG : PH_FINAL;
+        p->phase = p->co_yielded ? (p->sync ? PH_SYNC : PH_SEG) : PH_FINAL;
     }
 }
 
@@ -955,6 +974,25 @@ static bool validate_hook(Cpu *c) {
      * past its return frame without coming back through it (it popped its own
      * return address, as jump-table dispatchers do), there is no comparison
      * point: drop it as skipped. */
+    for (int k = 0; k < s_pend_n; k++) {
+        /* A native body waiting at a ROM sync point: the genuine routine has
+         * got there. Compare, and let the body go on from this machine. */
+        Pending *p = &s_pend[k];
+        /* (By address only, inside the routine: a native body need not keep
+         * the ROM's stack bytes, PHP/PHB, at the same depth.) */
+        if (p->phase != PH_SYNC || pc != p->sync_pc || c->sp > p->entry_sp) continue;
+        char buf[200], what[260];
+        int n = validate_diff(p, buf, sizeof(buf));
+        Validate *v = &s_val[p->idx];
+        if (n && irq_read_overlap(p)) { v->irqdep++; p->phase = PH_DONE; continue; }
+        if (n) {
+            snprintf(what, sizeof(what), "at sync point $%06X: %s", pc, buf);
+            v->calls++; record_fail(p, what, n); p->phase = PH_DONE; continue;
+        }
+        reset_piece(p);
+        if (!run_native(c, p, true)) { v->skipped++; p->phase = PH_DONE; continue; }
+        p->phase = p->co_yielded ? (p->sync ? PH_SYNC : PH_SEG) : PH_FINAL;
+    }
     if (s_fd_n && s_pend_n > 0) validate_frames(c, pc);
     while (s_pend_n > 0) {
         Pending *p = &s_pend[s_pend_n - 1];
@@ -963,10 +1001,14 @@ static bool validate_hook(Cpu *c) {
         if (p->phase == PH_DONE) {
             /* already counted */
         } else if (!back || p->phase == PH_FRAME) {
+            if (getenv("SNESRECOMP_VALIDATE_WHY"))
+                fprintf(stderr, "WHY $%06X skipped: %s\n", s_val[p->idx].addr,
+                        !back ? "the stack unwound past its return" : "returned inside a frame driver");
             s_val[p->idx].skipped++;
-        } else if (p->phase == PH_SEG) {
+        } else if (p->phase == PH_SEG || p->phase == PH_SYNC) {
             s_val[p->idx].calls++;
-            record_fail(p, "the native body waits for a frame, the ROM routine returned", 1);
+            record_fail(p, p->phase == PH_SEG ? "the native body waits for a frame, the ROM routine returned"
+                                              : "the native body waits at a sync point, the ROM routine returned", 1);
         } else {
             validate_compare(c, p);
         }
@@ -1026,7 +1068,7 @@ static bool validate_hook(Cpu *c) {
     p->frames = 0;
     p->phase = PH_FINAL;
     if (!run_native(c, p, false)) { v->skipped++; return true; }
-    p->phase = p->co_yielded ? PH_SEG : PH_FINAL;
+    p->phase = p->co_yielded ? (p->sync ? PH_SYNC : PH_SEG) : PH_FINAL;
     s_pend_n++;
     if (c->write != genuine_write) { s_genuine_write = c->write; c->write = genuine_write; }
     return true;
@@ -1048,6 +1090,8 @@ typedef struct {
     const TimedIntercept *e;
     bool yielded;
     uint32_t fd_addr;
+    bool sync;                    /* waits in a ROM loop (spin_pc) up to sync_pc */
+    uint32_t spin_pc, sync_pc;
     uint16_t native_s;
     uint8_t land_k; uint16_t land_pc, land_sp;
 } InterceptCo;
@@ -1076,6 +1120,7 @@ static bool intercept_frame_call(uint32_t snes_addr) {
     InterceptCo *t = s_ico_cur;
     if (!t || !frame_driver(snes_addr)) return false;
     t->yielded = true;
+    t->sync = false;
     t->fd_addr = snes_addr;
     t->native_s = g_cpu.S;
 #ifdef _WIN32
@@ -1110,6 +1155,16 @@ static void ico_after(Cpu *c, InterceptCo *t) {
         intercept_finish(c, t->e);
         return;
     }
+    if (t->sync) {
+        /* Run the ROM's own wait loop; come back where it falls through. */
+        c->sp = t->native_s;
+        c->k = (uint8_t)(t->spin_pc >> 16);
+        c->pc = (uint16_t)t->spin_pc;
+        t->land_k = (uint8_t)(t->sync_pc >> 16);
+        t->land_pc = (uint16_t)t->sync_pc;
+        t->land_sp = t->native_s;
+        return;
+    }
     const FrameDriver *fd = frame_driver(t->fd_addr);
     uint16_t sp = t->native_s;
     uint16_t ret = (uint16_t)(t->fd_addr - 1);
@@ -1127,6 +1182,43 @@ static void ico_after(Cpu *c, InterceptCo *t) {
     c->sp = sp;
     c->k = (uint8_t)(t->fd_addr >> 16);
     c->pc = (uint16_t)t->fd_addr;
+}
+
+/* A native body at a loop the ROM leaves only when an interrupt has run
+ * (LDA busy : BNE -). Under check the body waits there until the genuine
+ * routine reaches sync_pc (the instruction after its loop) at the same stack,
+ * and is compared there; in the timed loop the CPU runs the ROM's loop at
+ * spin_pc and the body goes on when it falls through to sync_pc (by address
+ * inside the routine under check; in the timed loop at the body's stack, the
+ * ROM loop running on it). False
+ * when neither runs the body: the caller then waits some other way. */
+bool recomp_rom_wait(uint32_t spin_pc, uint32_t sync_pc) {
+    Pending *p = s_co_cur;
+    if (p) {
+        p->co_yielded = true;
+        p->sync = true;
+        p->sync_pc = sync_pc;
+        p->native_s = g_cpu.S;
+#ifdef _WIN32
+        SwitchToFiber(p->co.ret);
+#else
+        swapcontext(&p->co.uc, &p->co.ret);
+#endif
+        return true;
+    }
+    InterceptCo *t = s_ico_cur;
+    if (!t) return false;
+    t->yielded = true;
+    t->sync = true;
+    t->spin_pc = spin_pc;
+    t->sync_pc = sync_pc;
+    t->native_s = g_cpu.S;
+#ifdef _WIN32
+    SwitchToFiber(t->co.ret);
+#else
+    swapcontext(&t->co.uc, &t->co.ret);
+#endif
+    return true;
 }
 
 /* A suspended body whose frame driver just returned? Resume it. */

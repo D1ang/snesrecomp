@@ -134,6 +134,16 @@ void recomp_timed_add_framed_intercept(uint32_t snes_addr, bool is_long);
  * also run as a plain intercept checks this before a frame-driver call and
  * otherwise hands over to the ROM (recomp_set_redirect). */
 bool recomp_frame_wait_possible(void);
+
+/*
+ * For native code at a loop the ROM leaves only once an interrupt has run
+ * (`-: LDA busy : BNE -`, the NMI clears it). spin_pc is that loop in the ROM,
+ * sync_pc the instruction after it. The body waits there (under lockstep
+ * validation until the genuine routine reaches sync_pc; in the timed loop the
+ * CPU runs the ROM loop) and returns true; false when it cannot wait so, and
+ * the caller must wait another way.
+ */
+bool recomp_rom_wait(uint32_t spin_pc, uint32_t sync_pc);
 /* True when a native body may run the C version of snes_addr: always under
  * lockstep validation, in the timed loop only for verified routines (the
  * intercepts). A caller can hand an unverified path to the ROM instead. */
