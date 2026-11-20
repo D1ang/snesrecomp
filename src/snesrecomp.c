@@ -373,6 +373,7 @@ void snesrecomp_end_frame(void) {
 
     /* Present video */
     snesrecomp_capture_tick();
+    { extern void romlog_note_frame(void); romlog_note_frame(); }
     platform_present_frame(s_pixel_buf);
 
     /* Queue audio */
@@ -435,6 +436,7 @@ void snesrecomp_realframe_end(void) {
     snes_setPixels(s_snes, s_pixel_buf);
     snes_setSamples(s_snes, s_audio_buf, SAMPLES_PER_FRAME);
     snesrecomp_capture_tick();
+    { extern void romlog_note_frame(void); romlog_note_frame(); }
     platform_present_frame(s_pixel_buf);
     platform_queue_audio(s_audio_buf, SAMPLES_PER_FRAME);
     platform_frame_sync();

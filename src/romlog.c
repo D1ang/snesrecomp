@@ -71,6 +71,47 @@ static uint8_t romlog_cpuRead(void *mem, uint32_t adr) {
 
 static const int k_unit[8] = { 1, 2, 2, 4, 4, 4, 2, 4 };   /* bytes per transfer unit */
 
+/* For the asset extractor: each VRAM DMA from the ROM (source, length, VRAM
+ * word address), what the PPU shows from each VRAM word (bit 0: 2bpp BG
+ * tiles, 1: 4bpp BG, 2: 8bpp BG, 3: sprites, set per frame from the BG mode,
+ * the enabled layers and their tile bases), and the sound chip's sample
+ * directory pages. Written next to the log as <log>.assets (text). */
+typedef struct { uint32_t src; uint32_t len; uint16_t dest; } VramDma;
+static VramDma s_vdma[4096];
+static int s_vdma_n;
+static uint8_t s_vuse[0x8000];
+static uint16_t s_dirs[16];
+static int s_dirs_n;
+static const uint8_t k_bpp[8][4] = {       /* per BG mode: bits per pixel of BG1-4 (0: none) */
+    { 2, 2, 2, 2 }, { 4, 4, 2, 0 }, { 4, 4, 0, 0 }, { 8, 4, 0, 0 },
+    { 8, 2, 0, 0 }, { 4, 2, 0, 0 }, { 4, 0, 0, 0 }, { 8, 0, 0, 0 } };
+
+static void mark_vuse(uint16_t base, uint32_t words, uint8_t bit) {
+    for (uint32_t i = 0; i < words; i++) s_vuse[(base + i) & 0x7FFF] |= bit;
+}
+
+void romlog_note_frame(void) {
+    Snes *sn = snesrecomp_get_snes();
+    if (!s_kind || !sn || !sn->ppu) return;
+    Ppu *p = sn->ppu;
+    if (p->forcedBlank) return;
+    for (int i = 0; i < 4; i++) {
+        uint8_t bpp = k_bpp[p->mode & 7][i];
+        if (!bpp || !(p->layer[i].mainScreenEnabled || p->layer[i].subScreenEnabled)) continue;
+        mark_vuse(p->bgLayer[i].tileAdr, 1024u * bpp * 4, bpp == 2 ? 1 : bpp == 4 ? 2 : 4);
+    }
+    if (p->layer[4].mainScreenEnabled || p->layer[4].subScreenEnabled) {
+        mark_vuse(p->objTileAdr1, 0x1000, 8);
+        mark_vuse(p->objTileAdr2, 0x1000, 8);
+    }
+    if (sn->apu && sn->apu->dsp) {
+        uint16_t d = sn->apu->dsp->dirPage;
+        int k = 0;
+        while (k < s_dirs_n && s_dirs[k] != d) k++;
+        if (k == s_dirs_n && s_dirs_n < 16) s_dirs[s_dirs_n++] = d;
+    }
+}
+
 /* Before a $420B/$420C write takes effect: mark what each started channel
  * will read from the ROM. */
 static void note_dma_start(uint16_t reg, uint8_t val) {
@@ -87,6 +128,9 @@ static void note_dma_start(uint16_t reg, uint8_t val) {
                         : (ch->bAdr == 0x22 ? sn->ppu->cgramPointer : 0);
             uint32_t who = ((uint32_t)ch->bAdr << 16) | at;
             uint16_t a = ch->aAdr;
+            if ((ch->bAdr == 0x18 || ch->bAdr == 0x19) && !ch->fixed && rom_off(base | a) >= 0 &&
+                s_vdma_n < (int)(sizeof s_vdma / sizeof *s_vdma))
+                s_vdma[s_vdma_n++] = (VramDma){ base | a, n, at };
             if (ch->fixed) n = 1;                            /* the same byte over and over */
             for (uint32_t j = 0; j < n; j++) {
                 mark(rom_off(base | a), 2, who);
@@ -137,6 +181,20 @@ static void romlog_dump(void) {
     fwrite(s_kind, 1, s_size, f);
     for (int k = 0; k < 4; k++) fwrite(s_first[k], 4, s_size, f);
     fclose(f);
+    char ap[sizeof s_path + 8];
+    snprintf(ap, sizeof ap, "%s.assets", s_path);
+    if ((f = fopen(ap, "w"))) {
+        for (int i = 0; i < s_vdma_n; i++)
+            fprintf(f, "vdma %06X %u %04X\n", s_vdma[i].src, s_vdma[i].len, s_vdma[i].dest);
+        for (int i = 0; i < s_dirs_n; i++) fprintf(f, "dir %04X\n", s_dirs[i]);
+        for (int w = 0; w < 0x8000; ) {                         /* runs of equal use */
+            int e = w;
+            while (e < 0x8000 && s_vuse[e] == s_vuse[w]) e++;
+            if (s_vuse[w]) fprintf(f, "vuse %04X %04X %u\n", w, e - w, s_vuse[w]);
+            w = e;
+        }
+        fclose(f);
+    }
     fprintf(stderr, "romlog: written %s\n", s_path);
 }
 
