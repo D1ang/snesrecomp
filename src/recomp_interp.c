@@ -1192,6 +1192,8 @@ static void ico_after(Cpu *c, InterceptCo *t) {
     c->pc = (uint16_t)t->fd_addr;
 }
 
+static bool rom_wait(uint32_t spin_pc, uint32_t sync_pc);
+
 /* A native body at a loop the ROM leaves only when an interrupt has run
  * (LDA busy : BNE -). Under check the body waits there until the genuine
  * routine reaches sync_pc (the instruction after its loop) at the same stack,
@@ -1201,6 +1203,15 @@ static void ico_after(Cpu *c, InterceptCo *t) {
  * ROM loop running on it). False
  * when neither runs the body: the caller then waits some other way. */
 bool recomp_rom_wait(uint32_t spin_pc, uint32_t sync_pc) {
+    /* The ROM's loop runs in its own bank; the body goes on in the bank it
+     * was entered in (its final RTS uses it). */
+    uint8_t pb = g_cpu.PB;
+    bool ok = rom_wait(spin_pc, sync_pc);
+    if (ok) g_cpu.PB = pb;
+    return ok;
+}
+
+static bool rom_wait(uint32_t spin_pc, uint32_t sync_pc) {
     Pending *p = s_co_cur;
     if (p) {
         p->co_yielded = true;
