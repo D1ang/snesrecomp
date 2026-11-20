@@ -544,7 +544,9 @@ typedef struct {
     bool co_yielded;                      /* stopped at a frame driver (else ended) */
     uint32_t fd_addr;                     /* the driver it stopped at */
     bool sync;                            /* stopped at a ROM sync point, not a driver */
-    uint32_t sync_pc;                     /* where the genuine routine meets it */
+    bool sync_met;                        /* the genuine routine reached spin_pc: compared */
+    uint32_t spin_pc;                     /* where the ROM's wait begins (compare there) */
+    uint32_t sync_pc;                     /* where it ends (the body goes on there) */
     uint16_t native_s;                    /* its S there (native view) */
     uint8_t ret_k; uint16_t ret_pc, ret_sp;   /* where the genuine driver returns */
     unsigned frames;                      /* frames passed so far */
@@ -861,12 +863,9 @@ static void validate_frames(Cpu *c, uint32_t pc) {
             Pending *p = &s_pend[k];
             if (c->sp >= p->entry_sp || (p->phase != PH_SEG && p->phase != PH_FINAL && p->phase != PH_SYNC)) continue;
             Validate *v = &s_val[p->idx];
-            if (p->phase == PH_SYNC) {
-                char what[120];
-                snprintf(what, sizeof(what), "the ROM waits for a frame here, the native body at sync point $%06X", p->sync_pc);
-                v->calls++; record_fail(p, what, 1); p->phase = PH_DONE;
-                continue;
-            }
+            /* A body waiting at a sync point lets the ROM run up to it,
+             * frames included (the ROM loop it waits in may take them). */
+            if (p->phase == PH_SYNC) { p->frames++; continue; }
             if (p->phase == PH_FINAL) {
                 v->calls++;
                 record_fail(p, "the ROM waits for a frame here, the native body had already returned", 1);
@@ -980,15 +979,24 @@ static bool validate_hook(Cpu *c) {
         Pending *p = &s_pend[k];
         /* (By address only, inside the routine: a native body need not keep
          * the ROM's stack bytes, PHP/PHB, at the same depth.) */
-        if (p->phase != PH_SYNC || pc != p->sync_pc || c->sp > p->entry_sp) continue;
-        char buf[200], what[260];
-        int n = validate_diff(p, buf, sizeof(buf));
+        if (p->phase != PH_SYNC || c->sp > p->entry_sp) continue;
         Validate *v = &s_val[p->idx];
-        if (n && irq_read_overlap(p)) { v->irqdep++; p->phase = PH_DONE; continue; }
-        if (n) {
-            snprintf(what, sizeof(what), "at sync point $%06X: %s", pc, buf);
-            v->calls++; record_fail(p, what, n); p->phase = PH_DONE; continue;
+        if (!p->sync_met) {
+            /* Compare where the ROM's wait begins: the body's state then. */
+            if (pc != p->spin_pc) continue;
+            char buf[200], what[260];
+            int n = validate_diff(p, buf, sizeof(buf));
+            if (n && irq_read_overlap(p)) { v->irqdep++; p->phase = PH_DONE; continue; }
+            if (n) {
+                snprintf(what, sizeof(what), "at the wait at $%06X: %s", pc, buf);
+                v->calls++; record_fail(p, what, n); p->phase = PH_DONE; continue;
+            }
+            p->sync_met = true;
+            reset_piece(p);
+            continue;
         }
+        /* The ROM's wait is over: the body goes on from the live machine. */
+        if (pc != p->sync_pc) continue;
         reset_piece(p);
         if (!run_native(c, p, true)) { v->skipped++; p->phase = PH_DONE; continue; }
         p->phase = p->co_yielded ? (p->sync ? PH_SYNC : PH_SEG) : PH_FINAL;
@@ -1197,6 +1205,10 @@ bool recomp_rom_wait(uint32_t spin_pc, uint32_t sync_pc) {
     if (p) {
         p->co_yielded = true;
         p->sync = true;
+        /* Waiting from the routine's own first instruction: nothing to
+         * compare before it, the ROM runs the whole routine. */
+        p->sync_met = spin_pc == s_val[p->idx].addr;
+        p->spin_pc = spin_pc;
         p->sync_pc = sync_pc;
         p->native_s = g_cpu.S;
 #ifdef _WIN32
