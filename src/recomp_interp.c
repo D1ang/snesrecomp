@@ -523,6 +523,7 @@ typedef struct {
     unsigned long irq;   /* calls an NMI/IRQ handler interrupted */
     unsigned long frames;   /* frames waited for inside checked calls */
     unsigned long irqdep;   /* calls not comparable: an interrupt changed WRAM the native body read */
+    unsigned long irqre;    /* of the calls, those that matched once rerun with the handler's writes first */
     char first[200];
     char first_reg[160];
 } Validate;
@@ -554,6 +555,11 @@ typedef struct {
     uint8_t ret_k; uint16_t ret_pc, ret_sp;   /* where the genuine driver returns */
     unsigned frames;                      /* frames passed so far */
     uint8_t *read_mask;                   /* WRAM the native body read (bit per byte) */
+    /* For calls an interrupt landed in: the machine at the call, and the
+     * values the handler wrote, so the body can be rerun with them. */
+    uint8_t *pre_state; int pre_size;
+    bool pre_ok;                          /* one piece from the entry: rerunnable */
+    uint8_t *irq_val;                     /* WRAM values the handler wrote */
 } Pending;
 enum { PH_FINAL,      /* native body ended: compare at the routine's return */
        PH_SEG,        /* native waits at a frame driver: compare when the ROM enters one */
@@ -610,8 +616,10 @@ static void genuine_write(void *mem, uint32_t adr, uint8_t val) {
     if (s_irq_active) {
         int w = wram_offset(adr);
         if (w >= 0)
-            for (int k = 0; k < s_irq_base && k < s_pend_n; k++)
+            for (int k = 0; k < s_irq_base && k < s_pend_n; k++) {
                 s_pend[k].irq_mask[w >> 3] |= (uint8_t)(1 << (w & 7));
+                s_pend[k].irq_val[w] = val;
+            }
     }
     s_genuine_write(mem, adr, val);
 }
@@ -635,6 +643,8 @@ void recomp_timed_validate_report(void) {
                 v->addr, v->calls, v->mem_fail, v->reg_fail, v->mx_fail, v->skipped, v->irq, v->frames, v->irqdep,
                 v->first[0] ? " first: " : "", v->first,
                 v->first_reg[0] ? " | reg: " : "", v->first_reg);
+        if (v->irqre)
+            fprintf(stderr, "VALIDATE_IRQRE %06X %lu\n", v->addr, v->irqre);
     }
 }
 
@@ -707,11 +717,42 @@ static bool irq_read_overlap(const Pending *p) {
     return false;
 }
 
+static bool run_native(Cpu *c, Pending *p, bool resume);
+
+/* A call an interrupt landed in, whose native body read what the handler
+ * wrote: run the body again from the machine at the call with the handler's
+ * WRAM writes already in place (as if the interrupt had come just before
+ * the call), and compare that. A routine that read the handler's values
+ * then matches; one that read them both before and after does not, and
+ * stays not comparable. Only for calls checked in one piece (no frames). */
+static uint8_t *s_gen_buf = NULL;
+static int validate_rerun(Cpu *c, Pending *p, char *buf, int bufsz) {
+    Snes *sn = snesrecomp_get_snes();
+    if (!s_gen_buf) s_gen_buf = (uint8_t *)malloc(1 << 20);
+    int gsize = snes_saveState(sn, s_gen_buf);
+    if (!snes_loadState(sn, p->pre_state, p->pre_size)) { fprintf(stderr, "validate: rerun restore failed\n"); abort(); }
+    for (int i = 0; i < 0x20000; i++)
+        if (p->irq_mask[i >> 3] & (1 << (i & 7))) sn->ram[i] = p->irq_val[i];
+    memset(p->read_mask, 0, 0x20000 / 8);
+    memset(p->nio_set, 0, sizeof(p->nio_set));
+    bool ok = run_native(c, p, false) && !p->co_yielded;
+    if (!snes_loadState(sn, s_gen_buf, gsize)) { fprintf(stderr, "validate: rerun restore failed\n"); abort(); }
+    int n = ok ? validate_diff(p, buf, bufsz) : -1;
+    if (getenv("SNESRECOMP_VALIDATE_WHY"))
+        fprintf(stderr, "WHY $%06X rerun with the interrupt first: %s%s\n", s_val[p->idx].addr,
+                n < 0 ? "not runnable" : n ? "differs, " : "matches", n > 0 ? buf : "");
+    return n;
+}
+
 static void validate_compare(Cpu *c, Pending *p) {
     Validate *v = &s_val[p->idx];
     char buf[200];
     int n = validate_diff(p, buf, sizeof(buf));
-    if (n && irq_read_overlap(p)) { v->irqdep++; return; }
+    if (n && irq_read_overlap(p)) {
+        if (!p->pre_ok || validate_rerun(c, p, buf, sizeof(buf)) != 0) { v->irqdep++; return; }
+        n = 0;
+        v->irqre++;
+    }
     if (p->irq_hit) v->irq++;
     v->calls++;
     if (n) {
@@ -1015,12 +1056,27 @@ static bool validate_hook(Cpu *c) {
         Pending *p = &s_pend[s_pend_n - 1];
         bool back = c->k == p->k && c->pc == p->pc && c->sp == p->sp;
         if (!back && c->sp <= p->sp) break;
-        if (p->phase == PH_DONE) {
+        /* S far above the call's frame: the routine has borrowed the stack
+         * pointer (TCS onto a table, PLA to read it; the save codecs do),
+         * not unwound past its return. Wait until S comes back. */
+        if (!back && (uint16_t)(c->sp - p->sp) >= 0x0400) break;
+        /* Back at the return address with S off by a few bytes: the ROM
+         * routine left with a different stack balance than the native body
+         * (an RTS out of a JSL, a pulled argument). A difference, not an
+         * unwind. */
+        bool near = !back && c->k == p->k && c->pc == p->pc && (uint16_t)(c->sp - p->sp + 4) <= 8;
+        if (near && p->phase != PH_DONE && p->phase != PH_FRAME) {
+            char what[120];
+            snprintf(what, sizeof(what), "returned with S $%04X, the native body with S $%04X", c->sp, p->sp);
+            s_val[p->idx].calls++;
+            record_fail(p, what, 1);
+        } else if (p->phase == PH_DONE) {
             /* already counted */
         } else if (!back || p->phase == PH_FRAME) {
             if (getenv("SNESRECOMP_VALIDATE_WHY"))
-                fprintf(stderr, "WHY $%06X skipped: %s\n", s_val[p->idx].addr,
-                        !back ? "the stack unwound past its return" : "returned inside a frame driver");
+                fprintf(stderr, "WHY $%06X skipped: %s (at $%02X:%04X, S %04X, its return $%02X:%04X S %04X)\n", s_val[p->idx].addr,
+                        !back ? "the stack unwound past its return" : "returned inside a frame driver",
+                        c->k, c->pc, c->sp, p->k, p->pc, p->sp);
             s_val[p->idx].skipped++;
         } else if (p->phase == PH_SEG || p->phase == PH_SYNC) {
             s_val[p->idx].calls++;
@@ -1064,6 +1120,8 @@ static bool validate_hook(Cpu *c) {
         p->irq_mask = (uint8_t *)malloc(0x20000 / 8);
         p->irq_vmask = (uint8_t *)malloc((IRQ_V_BITS + 7) / 8);
         p->read_mask = (uint8_t *)malloc(0x20000 / 8);
+        p->pre_state = (uint8_t *)malloc(1 << 20);
+        p->irq_val = (uint8_t *)malloc(0x20000);
     }
     memset(p->read_mask, 0, 0x20000 / 8);
     p->irq_hit = 0;
@@ -1084,7 +1142,10 @@ static bool validate_hook(Cpu *c) {
     p->fn = fn;
     p->frames = 0;
     p->phase = PH_FINAL;
+    p->pre_size = snes_saveState(sn, p->pre_state);
+    p->pre_ok = true;
     if (!run_native(c, p, false)) { v->skipped++; return true; }
+    if (p->co_yielded) p->pre_ok = false;
     p->phase = p->co_yielded ? (p->sync ? PH_SYNC : PH_SEG) : PH_FINAL;
     s_pend_n++;
     if (c->write != genuine_write) { s_genuine_write = c->write; c->write = genuine_write; }
