@@ -262,7 +262,7 @@ bool snesrecomp_begin_frame(void) {
 static void snesrecomp_capture_tick(void) {
     static int  s_frame_no   = 0;
     static int  s_parsed     = 0;
-    static int  s_shots[32];
+    static int  s_shots[256];
     static int  s_shot_count = 0;
     static long s_exit_frame = -1;
 
@@ -270,7 +270,7 @@ static void snesrecomp_capture_tick(void) {
         s_parsed = 1;
         const char *f = getenv("SNESRECOMP_SHOT_FRAMES");
         if (f) {
-            while (*f && s_shot_count < 32) {
+            while (*f && s_shot_count < 256) {
                 char *end;
                 long v = strtol(f, &end, 10);
                 if (end == f) break;

@@ -180,6 +180,9 @@ static unsigned long s_interp_calls = 0;   /* lets validation see a fallback */
 
 void recomp_interp_call(uint32_t snes_addr, bool is_long) {
     s_interp_calls++;
+    /* SNESRECOMP_VALIDATE_WHY: which callee has no C version. */
+    if (getenv("SNESRECOMP_VALIDATE_WHY"))
+        fprintf(stderr, "WHY interpreter call $%06X\n", snes_addr);
     Snes *snes = snesrecomp_get_snes();
     if (!snes || !snes->cpu) return;
     Cpu *c = snes->cpu;
@@ -644,8 +647,14 @@ static int validate_diff(Pending *p, char *buf, size_t bufsz) {
     for (int i = 0; i < 0x20000; i++) {
         if (i <= p->entry_sp && i > p->entry_sp - 0x100) continue;   /* stack scratch */
         if (p->irq_hit && (p->irq_mask[i >> 3] & (1 << (i & 7)))) continue;  /* handler wrote it */
-        if (sn->ram[i] != p->ram[i] && n++ == 0)
-            snprintf(buf, bufsz, "wram $%05X rom=%02X native=%02X", i, sn->ram[i], p->ram[i]);
+        if (sn->ram[i] != p->ram[i]) {
+            if (n++ == 0)
+                snprintf(buf, bufsz, "wram $%05X rom=%02X native=%02X", i, sn->ram[i], p->ram[i]);
+            /* SNESRECOMP_VALIDATE_DIFFS: every differing WRAM byte. */
+            if (getenv("SNESRECOMP_VALIDATE_DIFFS"))
+                fprintf(stderr, "DIFF $%06X wram $%05X rom=%02X native=%02X\n",
+                        s_val[p->idx].addr, i, sn->ram[i], p->ram[i]);
+        }
     }
     /* An interrupted call: what the handler wrote (WRAM bytes, video words,
      * I/O registers) is left out; everything else is compared as usual. */
