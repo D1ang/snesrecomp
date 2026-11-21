@@ -1064,8 +1064,8 @@ static bool validate_hook(Cpu *c) {
          * routine left with a different stack balance than the native body
          * (an RTS out of a JSL, a pulled argument). A difference, not an
          * unwind. */
-        bool near = !back && c->k == p->k && c->pc == p->pc && (uint16_t)(c->sp - p->sp + 4) <= 8;
-        if (near && p->phase != PH_DONE && p->phase != PH_FRAME) {
+        bool off_s = !back && c->k == p->k && c->pc == p->pc && (uint16_t)(c->sp - p->sp + 4) <= 8;
+        if (off_s && p->phase != PH_DONE && p->phase != PH_FRAME) {
             char what[120];
             snprintf(what, sizeof(what), "returned with S $%04X, the native body with S $%04X", c->sp, p->sp);
             s_val[p->idx].calls++;
