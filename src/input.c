@@ -313,6 +313,39 @@ static void pokes_apply(int frame) {
             bus_write8(s_pokes[i].bank, s_pokes[i].addr, s_pokes[i].val);
 }
 
+/* SNESRECOMP_PAD2_SCRIPT="frame:mask[:count] ...": controller 2 held with
+ * the buttons of mask (the $4218 bit layout: B $8000, Y $4000, Select
+ * $2000, Start $1000, up/down/left/right $0800-$0100, A $80, X $40,
+ * L $20, R $10; hex) for count frames (default 1) from that frame of the
+ * mouse script's count. Overrides the live keys while a step is on. */
+typedef struct { int frame, count; uint16_t mask; } PadStep;
+static PadStep s_psteps[256];
+static int     s_pstep_count = -1;
+static int pad2_script_mask(void) {
+    if (s_pstep_count < 0) {
+        s_pstep_count = 0;
+        const char *p = getenv("SNESRECOMP_PAD2_SCRIPT");
+        while (p && *p && s_pstep_count < 256) {
+            char *end;
+            long f = strtol(p, &end, 10);
+            if (end == p || *end != ':') break;
+            long m = strtol(end + 1, &end, 16);
+            long c = 1;
+            if (*end == ':') c = strtol(end + 1, &end, 10);
+            s_psteps[s_pstep_count].frame = (int)f;
+            s_psteps[s_pstep_count].mask = (uint16_t)m;
+            s_psteps[s_pstep_count].count = (int)c;
+            s_pstep_count++;
+            while (*end == ' ') end++;
+            p = end;
+        }
+    }
+    for (int i = 0; i < s_pstep_count; i++)
+        if (s_mscript_frame >= s_psteps[i].frame && s_mscript_frame < s_psteps[i].frame + s_psteps[i].count)
+            return s_psteps[i].mask;
+    return s_pstep_count ? 0 : -1;
+}
+
 static void mouse_script_apply(SnesMouseState *ms) {
     if (!s_mscript_parsed) mouse_script_parse();
     if (!s_mstep_count) return;
@@ -406,8 +439,13 @@ void recomp_input_update(void) {
         /* Player 2 joypad — second keyboard set + second gamepad. */
         ensure_gamepads();
         int block = menu_overlay_is_active();
-        for (int btn = 0; btn < 12; btn++)
-            snes_setButtonState(snes, 2, btn, block ? false : button_pressed(2, btn, keys));
+        int m = pad2_script_mask();
+        for (int btn = 0; btn < 12; btn++) {
+            /* button index -> $4218 bit: B..Right are bits 15..8, A X L R 7..4 */
+            uint16_t bit = (uint16_t)(btn < 8 ? 0x8000 >> btn : 0x0080 >> (btn - 8));
+            bool on = m >= 0 ? (m & bit) != 0 : (block ? false : button_pressed(2, btn, keys));
+            snes_setButtonState(snes, 2, btn, on);
+        }
     }
 }
 
