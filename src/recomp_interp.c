@@ -527,7 +527,7 @@ typedef struct {
     char first[200];
     char first_reg[160];
 } Validate;
-static Validate s_val[256];
+static Validate s_val[1024];
 static int      s_val_n = 0;
 
 typedef struct {
@@ -566,7 +566,10 @@ enum { PH_FINAL,      /* native body ended: compare at the routine's return */
        PH_FRAME,      /* genuine frame driver running: resume the native body when it returns */
        PH_SYNC,       /* native waits at a ROM sync point: compare when the ROM reaches it */
        PH_DONE };     /* decided early (failed or skipped): nothing more to compare */
-#define VAL_DEPTH 8
+/* Routines under check nested inside each other: a game loop checked whole,
+ * its dispatchers and their handlers add up; a call past this depth would go
+ * unchecked without a word. */
+#define VAL_DEPTH 32
 static Pending s_pend[VAL_DEPTH];
 static int     s_pend_n = 0;
 static uint8_t *s_state_buf = NULL;
@@ -884,6 +887,19 @@ static bool run_native(Cpu *c, Pending *p, bool resume) {
         p->pc = (uint16_t)(ret + 1);
         p->k  = is_long ? p->ram[(uint16_t)(sp + 3)] : c->k;
         p->sp = (uint16_t)(sp + (is_long ? 3 : 2));
+    } else if (!p->co_yielded) {
+        /* A body that rewrote its own return address (a jump-table
+         * dispatcher: the RTL lands in the handler) returns there: compare
+         * where the genuine routine lands too. A wrong address is never
+         * reached, and the call is then counted as skipped. */
+        uint16_t sp = c->sp;
+        uint16_t ret = (uint16_t)(p->ram[(uint16_t)(sp + 1)] | (p->ram[(uint16_t)(sp + 2)] << 8));
+        bool is_long = s_val[p->idx].is_long;
+        uint8_t k = is_long ? p->ram[(uint16_t)(sp + 3)] : p->k;
+        if ((uint16_t)(ret + 1) != p->pc || k != p->k) {
+            p->pc = (uint16_t)(ret + 1);
+            p->k  = k;
+        }
     }
     if (!snes_loadState(sn, s_state_buf, size)) {
         fprintf(stderr, "validate: state restore failed (size %d)\\n", size);
@@ -969,6 +985,9 @@ static bool validate_hook(Cpu *c) {
      * would overwrite the saved state the outer one restores from. */
     if (g_recomp_validating) return false;
     uint32_t pc = ((uint32_t)c->k << 16) | (uint16_t)c->pc;
+    static uint32_t s_prev_pc;
+    uint32_t prev_pc = s_prev_pc;
+    s_prev_pc = pc;
 
     /* Interrupt bookkeeping: the handler is entered at its vector with the
      * 4-byte interrupt frame pushed, and is done once RTI lifts the stack
@@ -1095,9 +1114,20 @@ static bool validate_hook(Cpu *c) {
     if (idx < 0 || s_pend_n >= VAL_DEPTH) return false;
     /* A loop that branches back to its own entry (BRA to the routine's first
      * instruction) passes the entry again at the same stack depth: that is
-     * not a call, the pending check of the routine covers it. */
-    for (int k = 0; k < s_pend_n; k++)
-        if (s_pend[k].idx == idx && s_pend[k].entry_sp == c->sp) return false;
+     * not a call, the pending check of the routine covers it. A JSR/JSL that
+     * arrives there at the same depth is a new call: a real nested call would
+     * be deeper, so the pending one never returned (an interrupt soft reset
+     * the machine). It and everything inside it can no longer be compared. */
+    for (int k = 0; k < s_pend_n; k++) {
+        if (s_pend[k].idx != idx || s_pend[k].entry_sp != c->sp) continue;
+        uint8_t op = bus_read8((uint8_t)(prev_pc >> 16), (uint16_t)prev_pc);
+        if (op != 0x20 && op != 0x22 && op != 0xFC) return false;
+        for (int j = k; j < s_pend_n; j++)
+            if (s_pend[j].phase != PH_DONE) s_val[s_pend[j].idx].irqdep++;
+        s_pend_n = k;
+        if (s_pend_n == 0 && c->write == genuine_write) c->write = s_genuine_write;
+        break;
+    }
     /* Each check copies the whole machine twice, so a routine called 100k
      * times would take minutes. SNESRECOMP_VALIDATE_MAX (default 300) caps the
      * checked calls per function; later calls just run genuine. */
