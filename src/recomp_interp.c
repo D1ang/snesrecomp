@@ -1231,11 +1231,15 @@ static bool intercept_frame_call(uint32_t snes_addr) {
     t->sync = false;
     t->fd_addr = snes_addr;
     t->native_s = g_cpu.S;
+    uint8_t pb = g_cpu.PB;
 #ifdef _WIN32
     SwitchToFiber(t->co.ret);
 #else
     swapcontext(&t->co.uc, &t->co.ret);
 #endif
+    /* The CPU comes back at the driver's entry, in the driver's bank; the
+     * body goes on in its own (a final RTS returns there). */
+    g_cpu.PB = pb;
     return true;
 }
 
